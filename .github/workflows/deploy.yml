@@ -1,0 +1,40 @@
+name: Deploy Agentra API
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy-agentra-api:
+    runs-on: self-hosted
+
+    env:
+      APP_DIR: /home/ubuntu/apps/agentra_api
+      APP_NAME: agentra_api
+      APP_PORT: 8086
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync files to server directory
+        run: |
+          mkdir -p "$APP_DIR"
+          rsync -a --delete \
+            --exclude=".git" \
+            --exclude=".github" \
+            ./ "$APP_DIR"/
+
+      - name: Start / Restart Agentra API with PM2
+        run: |
+          cd "$APP_DIR"
+
+          if ! pm2 list | grep -q "$APP_NAME"; then
+            pm2 start php --name "$APP_NAME" -- \
+              -S 127.0.0.1:$APP_PORT -t "$APP_DIR"
+          else
+            pm2 restart "$APP_NAME"
+          fi
+
+          pm2 save
