@@ -32,7 +32,7 @@ function resetPassword($conn, $input) {
 
     $user   = mysqli_fetch_assoc($result);
     $uid    = cleanInput($user['user_id']);
-    $hashed = cleanInput(password_hash($password, PASSWORD_BCRYPT));
+    $hashed = password_hash($password, PASSWORD_BCRYPT);
 
     mysqli_query($conn, "UPDATE " . CORE_SCHEMA . ".app_user
         SET password = '$hashed', reset_token = NULL, reset_token_expires_at = NULL

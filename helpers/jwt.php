@@ -2,8 +2,8 @@
 require_once __DIR__ . '/../config.php';
 
 class JWT {
-    const ACCESS_TTL  = 900;    // 15 minutes
-    const REFRESH_TTL = 604800; // 7 days
+    public const ACCESS_TTL  = 36000;  // 10 hours
+    public const REFRESH_TTL = 604800; // 7 days
 
     public static function encode(array $payload, int $expireSeconds = self::ACCESS_TTL): string {
         $header = self::base64url(json_encode(['alg' => 'HS256', 'typ' => 'JWT']));

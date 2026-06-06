@@ -35,8 +35,8 @@ $sub = mysqli_fetch_assoc($subResult);
 
 $activePolicyCount = 0;
 $policyResult = mysqli_query($conn, "SELECT COUNT(*) AS cnt
-    FROM " . APP_SCHEMA . ".app_policy
-    WHERE company_id = '$companyId' AND status = 'active'");
+    FROM " . APP_SCHEMA . ".policies
+    WHERE company_id = '$companyId' AND renewal_status NOT IN ('lapsed', 'cancelled')");
 if ($policyResult) {
     $pRow = mysqli_fetch_assoc($policyResult);
     $activePolicyCount = (int)($pRow['cnt'] ?? 0);

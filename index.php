@@ -73,6 +73,10 @@ switch ($module) {
         require __DIR__ . '/comissions/index.php';
         break;
 
+    case 'users':
+        require __DIR__ . '/users/index.php';
+        break;
+
     default:
         jsonResponse(404, 'Route not found');
 }

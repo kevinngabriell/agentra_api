@@ -11,7 +11,7 @@ function login($conn, $input){
         jsonResponse(422, 'Email and password are required');
     }
 
-    $result = mysqli_query($conn, "SELECT user_id, username, password, app_role_id FROM " . CORE_SCHEMA . ".app_user WHERE username = '$email' AND app_id = '7c2e6a2f-b254-4bbb-87f2-c6ece0f88db2' LIMIT 1");
+    $result = mysqli_query($conn, "SELECT user_id, username, password, app_role_id, company_id FROM " . CORE_SCHEMA . ".app_user WHERE username = '$email' AND app_id = '7c2e6a2f-b254-4bbb-87f2-c6ece0f88db2' LIMIT 1");
 
     if (!$result) {
         jsonResponse(500, 'Database error: ' . mysqli_error($conn));
@@ -28,9 +28,10 @@ function login($conn, $input){
     }
 
     $claims = [
-        'sub'      => $user['user_id'],
-        'username' => $user['username'],
-        'role'     => $user['app_role_id'],
+        'sub'        => $user['user_id'],
+        'username'   => $user['username'],
+        'role'       => $user['app_role_id'],
+        'company_id' => $user['company_id'],
     ];
 
     jsonResponse(200, 'Login successful', [
