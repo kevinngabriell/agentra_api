@@ -888,7 +888,6 @@ These routes return `501 Not Implemented`:
 
 | Endpoint | Description |
 |---|---|
-| `/api/v1/renewals` | Renewal management |
 | `/api/v1/services` | Services/products catalog |
 | `/api/v1/comissions` | Commission management |
 
@@ -936,3 +935,244 @@ pm.environment.set("refresh_token", res.data.refresh_token);
 ```
 Authorization: Bearer {{access_token}}
 ```
+
+---
+
+## Renewals
+
+All renewal endpoints require a valid Bearer token.
+
+---
+
+### RN-001 — List Renewals
+
+**GET** `/api/v1/renewals`
+
+Returns policies expiring in the given month with full renewal tracking info.
+
+**Query Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `month` | string | current month | Format `YYYY-MM` |
+| `renewal_status` | string | *(all)* | Filter: `pending`, `renewed`, `lapsed`, `cancelled` |
+| `page` | int | 1 | Page number |
+| `limit` | int | 10 | Items per page (max 100) |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Renewals found",
+  "data": {
+    "month": "2025-05",
+    "data": [
+      {
+        "policy_id": "pol_abc",
+        "policy_number": "01/08/...",
+        "product_type": "fire",
+        "coverage_end": "2025-05-02",
+        "renewal_status": "pending",
+        "payment_status": "unpaid",
+        "premium_amount": 5000000,
+        "commission_amount": 250000,
+        "days_until_expiry": 2,
+        "customer_name": "Budi Santoso",
+        "customer_whatsapp": "081234567890",
+        "insurer_name": "Chubb",
+        "last_follow_up_status": "contacted",
+        "last_follow_up_date": "2025-04-28"
+      }
+    ],
+    "pagination": {
+      "total": 84,
+      "page": 1,
+      "limit": 10,
+      "total_pages": 9
+    }
+  }
+}
+```
+
+---
+
+### RN-002 — Renewal Stats (StatusPerpanjangan)
+
+**GET** `/api/v1/renewals/stats`
+
+Returns aggregated renewal stats for the StatusPerpanjangan component.
+
+**Query Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `month` | string | current month | Format `YYYY-MM` |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Renewal stats retrieved",
+  "data": {
+    "month": "2025-05",
+    "total": 84,
+    "achieved_omzet": 620000000,
+    "total_omzet_potential": 850000000,
+    "breakdown": {
+      "renewed":     { "count": 54, "pct": 64.3 },
+      "in_progress": { "count": 17, "pct": 20.2 },
+      "lapsed":      { "count": 10, "pct": 11.9 },
+      "cancelled":   { "count": 3,  "pct": 3.6  }
+    }
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `total` | All policies with `coverage_end` in the given month |
+| `achieved_omzet` | Sum of `premium_amount` for `renewed` policies (IDR) |
+| `total_omzet_potential` | Sum of `premium_amount` for all policies in the month (IDR) |
+| `breakdown.renewed` | Policies successfully renewed |
+| `breakdown.in_progress` | Policies still pending renewal (`renewal_status = pending`) |
+| `breakdown.lapsed` | Policies that lapsed without renewal |
+
+> **Note:** `total_omzet_potential` serves as the omzet target proxy derived from the actual book of business. A separate company target-setting endpoint can be added later to override this with a manual target.
+
+---
+
+## Dashboard
+
+All dashboard endpoints require a valid Bearer token. Scope: **Main Agent** sees all company data; **Sub-Agent** sees only their own records (role-based filtering to be wired once role IDs are finalised).
+
+---
+
+### DB-001 — Dashboard Stats
+
+**GET** `/api/v1/dashboard/stats`
+
+Returns aggregated stat cards for the top row of the dashboard.
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "OK",
+  "data": {
+    "total_active_policies": 1024,
+    "renewals_this_month": 47,
+    "expiring_this_week": 8,
+    "pending_commissions_amount": 12400000,
+    "renewal_breakdown": {
+      "total": 84,
+      "renewed": 54,
+      "in_progress": 17,
+      "lapsed": 10,
+      "cancelled": 3,
+      "achieved_omzet": 620000000,
+      "renewed_pct": 64.3,
+      "in_progress_pct": 20.2,
+      "lapsed_pct": 11.9
+    },
+    "trends": {
+      "policies_vs_last_month": "+2.1%",
+      "renewals_vs_last_month": "+5 polis"
+    }
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `total_active_policies` | Policies not lapsed or cancelled |
+| `renewals_this_month` | Policies with `coverage_end` in current month and `renewal_status = pending` |
+| `expiring_this_week` | Pending policies expiring within the next 7 days |
+| `pending_commissions_amount` | Sum of `expected_amount` from commissions with `status = pending` (IDR) |
+| `renewal_breakdown.total` | All policies with `coverage_end` in current month |
+| `renewal_breakdown.renewed` | Count with `renewal_status = renewed` |
+| `renewal_breakdown.in_progress` | Count with `renewal_status = pending` |
+| `renewal_breakdown.achieved_omzet` | Sum of `premium_amount` for renewed policies (IDR) |
+| `renewal_breakdown.renewed_pct` | Percentage of total that are renewed |
+| `trends.policies_vs_last_month` | % change in policies created vs prior month |
+| `trends.renewals_vs_last_month` | Absolute change in renewals vs prior month |
+
+---
+
+### DB-002 — Activity Feed
+
+**GET** `/api/v1/dashboard/activity`
+
+Returns the recent activity log for the bottom section of the dashboard.
+
+**Query Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | 10 | Max items to return (max 50) |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "OK",
+  "data": {
+    "items": [
+      {
+        "id": "log_abc123",
+        "type": "policy_updated",
+        "description": "Polis Budi Santoso diperbarui",
+        "link": "/policies/pol_xyz",
+        "actor": { "name": "Muksin" },
+        "created_at": "2025-04-30T10:30:00Z"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### DB-003 — Today's Urgent Actions
+
+**GET** `/api/v1/dashboard/today-actions`
+
+Returns policies expiring within the next 7 days that still have `renewal_status = pending`.
+
+**Query Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | 10 | Max items to return (max 50) |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "OK",
+  "data": {
+    "items": [
+      {
+        "policy_id": "pol_abc",
+        "policy_number": "01/08/...",
+        "customer_name": "Budi Santoso",
+        "customer_whatsapp": "081234567890",
+        "product_type": "fire",
+        "insurer_name": "Chubb",
+        "coverage_end": "2025-05-02",
+        "days_until_expiry": 2,
+        "renewal_status": "pending",
+        "last_follow_up_status": "contacted"
+      }
+    ],
+    "total_today": 3,
+    "total_week": 11
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `items` | Policies sorted by `coverage_end` ascending |
+| `last_follow_up_status` | Most recent status from `follow_up_logs` for this policy |
+| `total_today` | Count of policies expiring today |
+| `total_week` | Count of policies expiring within 7 days |
