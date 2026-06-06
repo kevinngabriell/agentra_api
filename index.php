@@ -1,41 +1,82 @@
 <?php
-require_once __DIR__ . '/config/config.php';
-require_once __DIR__ . '/helpers/response.php';
+require_once __DIR__ . '/general.php';
 
-header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Authorization, Content-Type');
+$uri    = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+$uri    = trim($uri, '/');
+$parts  = explode('/', $uri);
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-  http_response_code(204);
-  exit;
-}
-
-$uri   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-$uri   = trim($uri, '/');
-$parts = explode('/', $uri);
-
-// Expect: api / v1 / {group} / {action}
-$prefix  = $parts[0] ?? '';   // "api"
-$version = $parts[1] ?? '';   // "v1"
-$group   = $parts[2] ?? '';   // "auth"
-$action  = $parts[3] ?? '';   // "login", "refresh", etc.
+// Expect: api / v1 / {module} / {action}
+$prefix  = $parts[0] ?? '';
+$version = $parts[1] ?? '';
+$module  = $parts[2] ?? '';
+$action  = $parts[3] ?? '';
 
 if ($prefix !== 'api' || $version !== 'v1') {
-  Response::error('Route not found', 404);
+    jsonResponse(404, 'Route not found');
 }
 
-switch ($group) {
-  case 'auth':
-    require __DIR__ . '/routes/auth.php';
-    break;
+switch ($module) {
 
-  // Add new route groups here:
-  // case 'agents':
-  //   require __DIR__ . '/routes/agents.php';
-  //   break;
+    case 'auth':
+        $actionMap = [
+            'login'           => 'login.php',
+            'register'        => 'register.php',
+            'refresh'         => 'refresh.php',
+            'logout'          => 'logout.php',
+            'forgot-password' => 'forgot-password.php',
+            'reset-password'  => 'reset-password.php',
+        ];
+        $file = isset($actionMap[$action]) ? __DIR__ . '/auth/' . $actionMap[$action] : null;
+        if (!$file) jsonResponse(404, 'Route not found');
+        require $file;
+        break;
 
-  default:
-    Response::error('Route not found', 404);
+    case 'plans':
+        if ($action === '') {
+            require __DIR__ . '/plans/index.php';
+        } else {
+            require __DIR__ . '/plans/detail.php';
+        }
+        break;
+
+    case 'subscription':
+        $actionMap = [
+            'current'     => 'current.php',
+            'change-plan' => 'change-plan.php',
+        ];
+        $file = isset($actionMap[$action]) ? __DIR__ . '/subscription/' . $actionMap[$action] : null;
+        if (!$file) jsonResponse(404, 'Route not found');
+        require $file;
+        break;
+
+    case 'customers':
+        require __DIR__ . '/customers/index.php';
+        break;
+
+    case 'insurers':
+        require __DIR__ . '/insurers/index.php';
+        break;
+
+    case 'policies':
+        require __DIR__ . '/policies/index.php';
+        break;
+
+    case 'renewals':
+        require __DIR__ . '/renewals/index.php';
+        break;
+
+    case 'services':
+        require __DIR__ . '/services/index.php';
+        break;
+
+    case 'comissions':
+        require __DIR__ . '/comissions/index.php';
+        break;
+
+    case 'users':
+        require __DIR__ . '/users/index.php';
+        break;
+
+    default:
+        jsonResponse(404, 'Route not found');
 }
