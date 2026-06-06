@@ -49,6 +49,10 @@ switch ($module) {
         require $file;
         break;
 
+    case 'dashboard':
+        require __DIR__ . '/dashboard/index.php';
+        break;
+
     case 'customers':
         require __DIR__ . '/customers/index.php';
         break;
