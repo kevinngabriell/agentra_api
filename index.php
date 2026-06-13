@@ -5,7 +5,7 @@ $uri    = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $uri    = trim($uri, '/');
 $parts  = explode('/', $uri);
 
-// Expect: api / v1 / {module} / {action}
+// Expect: api / v1 / {module} / {action} [/ {sub_action} [/ {sub_id}]]
 $prefix  = $parts[0] ?? '';
 $version = $parts[1] ?? '';
 $module  = $parts[2] ?? '';
@@ -71,6 +71,10 @@ switch ($module) {
 
     case 'services':
         require __DIR__ . '/services/index.php';
+        break;
+
+    case 'master-products':
+        require __DIR__ . '/master-products/index.php';
         break;
 
     case 'comissions':
