@@ -3,6 +3,38 @@
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 
+// Looks up commission rate from master_products.
+// Matches first by product_code (= product_type), then by policy number prefix via policy_prefixes.
+// Returns ['rate' => float, 'product_name' => string] or null if no match.
+function resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number) {
+    $company_id   = mysqli_real_escape_string($conn, $company_id);
+    $product_code = strtolower(trim(mysqli_real_escape_string($conn, $product_type)));
+
+    $res = mysqli_query($conn,
+        "SELECT commission_rate, product_name FROM " . APP_SCHEMA . ".master_products
+         WHERE company_id = '$company_id' AND product_code = '$product_code' AND is_active = 1 LIMIT 1"
+    );
+    if ($res && mysqli_num_rows($res) > 0) {
+        $row = mysqli_fetch_assoc($res);
+        return ['rate' => (float)$row['commission_rate'], 'product_name' => $row['product_name']];
+    }
+
+    // Fall back: match by policy number prefix stored in policy_prefixes
+    $prefix = substr(preg_replace('/\s+/', '', $policy_number), 0, 2);
+    $prefix = mysqli_real_escape_string($conn, $prefix);
+    $res = mysqli_query($conn,
+        "SELECT commission_rate, product_name FROM " . APP_SCHEMA . ".master_products
+         WHERE company_id = '$company_id' AND is_active = 1
+         AND FIND_IN_SET('$prefix', REPLACE(policy_prefixes, ' ', '')) > 0 LIMIT 1"
+    );
+    if ($res && mysqli_num_rows($res) > 0) {
+        $row = mysqli_fetch_assoc($res);
+        return ['rate' => (float)$row['commission_rate'], 'product_name' => $row['product_name']];
+    }
+
+    return null;
+}
+
 // --- GET ALL (PO-001) ---
 function getAllPolicies($conn, $company_id, $params){
     $page           = max(1, (int)($params['page']   ?? 1));
@@ -24,8 +56,7 @@ function getAllPolicies($conn, $company_id, $params){
     if ($customer_id) {
         $where .= " AND p.customer_id = '$customer_id'";
     }
-    $valid_types = ['fire', 'motorcycle', 'car', 'travel', 'cargo', 'other'];
-    if ($product_type && in_array($product_type, $valid_types, true)) {
+    if ($product_type) {
         $where .= " AND p.product_type = '$product_type'";
     }
     if ($insurer_id) {
@@ -81,7 +112,7 @@ function getAllPolicies($conn, $company_id, $params){
 
 // --- CREATE (PO-002) ---
 function createPolicy($conn, $input, $username, $company_id){
-    $required = ['insurer_id', 'customer_id', 'policy_number', 'product_type', 'coverage_start', 'coverage_end', 'sum_insured', 'premium_amount', 'commission_rate'];
+    $required = ['insurer_id', 'customer_id', 'policy_number', 'product_type', 'coverage_start', 'coverage_end', 'sum_insured', 'premium_amount'];
     foreach ($required as $field) {
         if (!isset($input[$field]) || is_string($input[$field]) && trim($input[$field]) === '') {
             jsonResponse(400, "$field is required");
@@ -92,10 +123,15 @@ function createPolicy($conn, $input, $username, $company_id){
     $insurer_id    = mysqli_real_escape_string($conn, $input['insurer_id']);
     $customer_id   = mysqli_real_escape_string($conn, $input['customer_id']);
     $policy_number = trim(mysqli_real_escape_string($conn, $input['policy_number']));
-    $product_type  = trim(mysqli_real_escape_string($conn, $input['product_type']));
+    $product_type  = strtolower(trim(mysqli_real_escape_string($conn, $input['product_type'])));
 
-    if (!in_array($product_type, ['fire', 'motorcycle', 'car', 'travel', 'cargo', 'other'], true)) {
-        jsonResponse(400, 'Invalid product_type. Must be: fire, motorcycle, car, travel, cargo, or other');
+    // Validate product_type against master_products
+    $pt_check = mysqli_query($conn,
+        "SELECT 1 FROM " . APP_SCHEMA . ".master_products
+         WHERE company_id = '$company_id' AND product_code = '$product_type' AND is_active = 1 LIMIT 1"
+    );
+    if (!$pt_check || mysqli_num_rows($pt_check) === 0) {
+        jsonResponse(400, 'Invalid product_type. Must match an active product code in master products.');
         return;
     }
 
@@ -111,9 +147,19 @@ function createPolicy($conn, $input, $username, $company_id){
         return;
     }
 
-    $sum_insured       = (int)$input['sum_insured'];
-    $premium_amount    = (int)$input['premium_amount'];
-    $commission_rate   = round((float)$input['commission_rate'], 2);
+    $sum_insured    = (int)$input['sum_insured'];
+    $premium_amount = (int)$input['premium_amount'];
+
+    if (isset($input['commission_rate']) && $input['commission_rate'] !== '') {
+        $commission_rate = round((float)$input['commission_rate'], 2);
+    } else {
+        $resolved = resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number);
+        if ($resolved === null) {
+            jsonResponse(400, 'commission_rate is required: no commission rule found for this product type or policy number prefix');
+            return;
+        }
+        $commission_rate = $resolved['rate'];
+    }
     $commission_amount = (int)round($premium_amount * $commission_rate / 100);
 
     // Unique policy number per company
@@ -460,7 +506,7 @@ if (!$company_id) {
 }
 
 // $action     = $parts[3] — policy_id, 'payment-summary', or ''
-// $sub_action = $parts[4] — 'renewal-status', 'follow-ups', 'payment-status', or ''
+// $sub_action = $parts[4] — 'renewal-status', 'follow-ups', 'payment-status', 'coverages', or ''
 $policy_id  = (!empty($action) && $action !== 'payment-summary') ? $action : null;
 $sub_action = $parts[4] ?? '';
 
@@ -490,6 +536,9 @@ try {
             case 'payment-status':
                 if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
                 updatePaymentStatus($conn, $policy_id, $company_id, $input, $username);
+                break;
+            case 'coverages':
+                require __DIR__ . '/coverages.php';
                 break;
             default:
                 jsonResponse(404, 'Route not found');

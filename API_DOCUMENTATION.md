@@ -689,7 +689,7 @@ Auth required.
 | limit | Default: 10, max: 100 |
 | search | Search by policy number or customer name |
 | customer_id | Filter by customer |
-| product_type | `fire`, `motorcycle`, `car`, `travel`, `cargo`, `other` |
+| product_type | `fire`, `motorcycle`, `car`, `travel`, `cargo`, `other`, `kecelakaan`, `aep` |
 | insurer_id | Filter by insurer |
 | renewal_status | `pending`, `renewed`, `lapsed`, `cancelled` |
 | expiry_month | Format: `YYYY-MM` |
@@ -729,12 +729,12 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
 | insurer_id | string | Yes | From `/insurers` |
 | customer_id | string | Yes | From `/customers` |
 | policy_number | string | Yes | Unique per company |
-| product_type | string | Yes | `fire`, `motorcycle`, `car`, `travel`, `cargo`, `other` |
+| product_type | string | Yes | `fire`, `motorcycle`, `car`, `travel`, `cargo`, `other`, `kecelakaan`, `aep` |
 | coverage_start | string | Yes | YYYY-MM-DD |
 | coverage_end | string | Yes | YYYY-MM-DD |
 | sum_insured | integer | Yes | Coverage amount (IDR) |
 | premium_amount | integer | Yes | Premium (IDR) |
-| commission_rate | float | Yes | Commission % (e.g. `10.5`) |
+| commission_rate | float | **No** | Commission %. If omitted, auto-resolved from policy number prefix and product type (see [Commission Auto-Resolution](#commission-auto-resolution)). Required only if no rule matches. |
 | policy_year | integer | No | Default: 1 |
 | object_insured | string | No | Description of insured object |
 | coverage_notes | string | No | Coverage details |
@@ -745,6 +745,21 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
 ```json
 { "data": { "policy_id": "pol_xxx" } }
 ```
+
+#### Commission Auto-Resolution
+
+If `commission_rate` is not provided, the API derives it automatically using the following rules (evaluated in order):
+
+| Priority | Condition | Rate |
+|---|---|---|
+| 1 | `product_type = aep` | 30% |
+| 2 | `product_type = kecelakaan` | 20% |
+| 3 | Policy number starts with `01`, `08`, `88`, `61`, or `62` | 15% |
+| 4 | Policy number starts with `02` | 25% |
+
+If none of the rules match and `commission_rate` is not provided, the API returns `400 commission_rate is required: no rule matched for this policy number prefix or product type`.
+
+You can always pass `commission_rate` explicitly to override auto-resolution.
 
 ---
 
@@ -882,7 +897,131 @@ Auth required. **Main Agent only.**
 
 ---
 
-## 7. Not Yet Implemented
+## 7. Master Products
+
+Manages the product catalog and their default commission rates. `product_code` is what gets stored in `policies.product_type`.
+
+**Base path:** `/api/v1/master-products`
+
+All endpoints require `Authorization: Bearer <access_token>`.
+
+---
+
+### 7.1 List All Master Products
+
+**GET** `/api/v1/master-products`
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Master products found",
+  "data": {
+    "data": [
+      {
+        "product_id":      "prod_6849abc123",
+        "product_code":    "kebakaran",
+        "product_name":    "Kebakaran",
+        "commission_rate": "15.00",
+        "policy_prefixes": "01,08,88,61,62",
+        "is_active":       1,
+        "created_at":      "2026-06-13 09:00:00",
+        "updated_at":      "2026-06-13 09:00:00"
+      },
+      {
+        "product_id":      "prod_6849abc456",
+        "product_code":    "aep",
+        "product_name":    "Tanggung Gugat Pihak Ketiga",
+        "commission_rate": "30.00",
+        "policy_prefixes": null,
+        "is_active":       1,
+        "created_at":      "2026-06-13 09:00:00",
+        "updated_at":      "2026-06-13 09:00:00"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 7.2 Create Master Product
+
+**POST** `/api/v1/master-products`
+
+**Request Body:**
+```json
+{
+  "product_code":    "kebakaran",
+  "product_name":    "Kebakaran",
+  "commission_rate": 15,
+  "policy_prefixes": "01,08,88,61,62"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `product_code` | string | Yes | Unique code per company (stored as `product_type` on policies). Lowercase. |
+| `product_name` | string | Yes | Human-readable name |
+| `commission_rate` | float | Yes | Default commission % (0–100) |
+| `policy_prefixes` | string | No | Comma-separated policy number prefixes for auto-detection (e.g. `01,08,88,61,62`) |
+
+**Response `201`:**
+```json
+{ "data": { "product_id": "prod_xxx" } }
+```
+
+---
+
+### 7.3 Get Master Product Detail
+
+**GET** `/api/v1/master-products/{product_id}`
+
+---
+
+### 7.4 Update Master Product
+
+**PUT** `/api/v1/master-products/{product_id}`
+
+All fields optional. Send only what changes.
+
+| Field | Type | Description |
+|---|---|---|
+| `product_code` | string | Must remain unique within company |
+| `product_name` | string | Display name |
+| `commission_rate` | float | New default commission % |
+| `policy_prefixes` | string | Send empty string `""` to clear prefixes |
+| `is_active` | boolean | `false` deactivates the product |
+
+---
+
+### 7.5 Delete Master Product
+
+**DELETE** `/api/v1/master-products/{product_id}`
+
+---
+
+### 7.6 How commission is resolved when creating a policy
+
+When `commission_rate` is omitted in `POST /policies`, the API resolves it automatically:
+
+1. **By `product_type` (exact match)** — finds the master product where `product_code = product_type` and uses its `commission_rate`.
+2. **By policy number prefix (fallback)** — extracts the first 2 characters of the policy number and checks if any master product's `policy_prefixes` contains it.
+
+If neither matches, the request returns `400`. Pass `commission_rate` explicitly to override auto-resolution for any product.
+
+### 7.7 Recommended seed data
+
+| `product_code` | `product_name` | `commission_rate` | `policy_prefixes` |
+|---|---|---|---|
+| `kebakaran` | Kebakaran | 15% | `01,08,88,61,62` |
+| `kendaraan` | Kendaraan Bermotor | 25% | `02` |
+| `aep` | Tanggung Gugat Pihak Ketiga | 30% | — |
+| `kecelakaan` | Kecelakaan Diri | 20% | — |
+
+---
+
+## 8. Not Yet Implemented
 
 These routes return `501 Not Implemented`:
 
