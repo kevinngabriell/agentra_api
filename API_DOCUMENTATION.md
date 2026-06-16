@@ -22,13 +22,21 @@
 Follow this sequence to avoid dependency errors:
 
 ```
-1. Register          → POST /auth/register
-2. Login             → POST /auth/login        ← save access_token + refresh_token
-3. Get Plans         → GET  /plans?app_id=...  (no auth needed)
-4. Create Insurer    → POST /insurers
-5. Create Customer   → POST /customers
-6. Create Policy     → POST /policies          ← needs insurer_id + customer_id
-7. Follow-up / Status updates as needed
+1.  Register          → POST  /auth/register
+2.  Login             → POST  /auth/login                   ← save access_token + refresh_token
+3.  Get Plans         → GET   /plans?app_id=...             (no auth needed)
+4.  Create Insurer    → POST  /insurers
+5.  Create Customer   → POST  /customers
+6.  Create Policy     → POST  /policies                     ← auto-creates commission record
+7.  Add Coverages     → POST  /policies/{id}/coverages      ← optional, syncs premium & commission
+8.  Follow-up         → POST  /policies/{id}/follow-ups
+9.  Update Statuses   → PATCH /policies/{id}/payment-status
+                        PATCH /policies/{id}/renewal-status
+10. View Commission   → GET   /policies/{id}/commission     ← agent sees expected commission
+11. View History      → GET   /policies/{id}/logs           ← full event timeline
+12. Commission List   → GET   /commissions                  ← all commission records
+13. Commission Stats  → GET   /commissions/summary          ← pending/received/discrepancy totals
+14. Mark Received     → PATCH /commissions/{id}/mark-received ← record actual payment from insurer
 ```
 
 > **Tip:** Set a Postman environment variable `{{access_token}}` after login, then use `Authorization: Bearer {{access_token}}` on all protected endpoints.
@@ -843,23 +851,23 @@ Auth required.
 **Request Body:**
 ```json
 {
-  "follow_up_date": "2025-06-05",
-  "action_type": "whatsapp",
-  "notes": "Sent renewal reminder to customer",
-  "outcome": "Customer confirmed renewal interest"
+  "followup_status": "customer_confirmed",
+  "channel": "whatsapp",
+  "notes": "Customer confirmed renewal interest",
+  "follow_up_date": "2025-06-05"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| follow_up_date | string | No | YYYY-MM-DD, default: today |
-| action_type | string | No | Type of action taken |
-| notes | string | No | What was done |
-| outcome | string | No | Result |
+| followup_status | string | No | `not_contacted`, `contacted`, `customer_confirmed`, `customer_declined`, `no_response`. Default: `not_contacted` |
+| channel | string | No | `whatsapp`, `phone`, `email`, `in_person` |
+| notes | string | No | Free-text notes about the follow-up |
+| follow_up_date | string | No | YYYY-MM-DD. Default: today |
 
 **Response `201`:**
 ```json
-{ "data": { "follow_up_id": "flw_xxx" } }
+{ "data": { "followup_id": "fu_xxx" } }
 ```
 
 ---
@@ -894,6 +902,217 @@ Auth required. **Main Agent only.**
   }
 }
 ```
+
+---
+
+### 6.9 Get Policy Commission
+
+**GET** `/api/v1/policies/{policy_id}/commission`
+
+Auth required. Returns the commission record for this policy so the agent can see the expected amount, received amount, and current status.
+
+> A commission record is **auto-created** when a policy is created (`POST /policies`) and **auto-updated** whenever `premium_amount` or `commission_rate` changes via `PUT /policies/{id}` or any coverage write. There is no manual create/update endpoint — the record is always derived from the policy.
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Commission found",
+  "data": {
+    "commission_id": "com_6849abc",
+    "policy_id": "pol_6849xyz",
+    "company_id": "08a0f8a7-...",
+    "insurer_id": "ins_xxx",
+    "insurer_name": "PT Chubb General Insurance Indonesia",
+    "insurer_short_name": "CHUBB",
+    "policy_number": "01/08/25/00001",
+    "product_type": "kebakaran",
+    "coverage_start": "2025-06-01",
+    "coverage_end": "2026-06-01",
+    "commission_type": "direct",
+    "premium_amount": 5000000,
+    "commission_rate": "15.00",
+    "expected_amount": 750000,
+    "received_amount": 0,
+    "status": "pending",
+    "expected_date": null,
+    "received_date": null,
+    "reference_number": null,
+    "discrepancy_notes": null,
+    "marked_by": null,
+    "marked_at": null,
+    "created_at": "2026-06-16 09:00:00",
+    "updated_at": "2026-06-16 09:00:00"
+  }
+}
+```
+
+**Field reference:**
+
+| Field | Description |
+|---|---|
+| `commission_type` | `direct` = agent's own policy; `override` = from sub-agent policy |
+| `premium_amount` | Snapshot of policy premium at last sync (IDR) |
+| `commission_rate` | Rate % at last sync |
+| `expected_amount` | `premium_amount × commission_rate / 100` (IDR) |
+| `received_amount` | Amount actually received from insurer (IDR). `0` until marked received |
+| `status` | `pending` → `received` or `discrepancy` (when received ≠ expected). `cancelled` if policy voided |
+| `expected_date` | Date agent expects insurer to pay (set manually) |
+| `received_date` | Date insurer actually paid |
+| `reference_number` | Insurer's payment reference number |
+| `discrepancy_notes` | Notes explaining the discrepancy |
+
+**`status` lifecycle:**
+
+```
+policy created  →  pending
+                      ↓
+               mark received
+                   /      \
+            received     discrepancy
+          (matches)     (received ≠ expected)
+```
+
+**Response `404`:** Policy not found, or commission record not yet created (only happens for policies created before this feature was deployed).
+
+---
+
+### 6.10 Get Policy Logs
+
+**GET** `/api/v1/policies/{policy_id}/logs`
+
+Auth required. Returns the full chronological event history for a policy — creation, endorsements, payment changes, follow-ups, coverage edits, and renewal status changes — newest first.
+
+> **Tip for FE:** Use this endpoint to render the activity timeline on the policy detail page. Pair with `GET /policies/{id}/commission` (section 6.9) to show the commission card alongside the history.
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| page | int | 1 | Page number |
+| limit | int | 20 | Items per page (max 100) |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Policy logs retrieved",
+  "data": {
+    "data": [
+      {
+        "log_id": "plog_abc123",
+        "event_type": "payment_status_changed",
+        "reference_type": null,
+        "reference_id": null,
+        "old_value": "unpaid",
+        "new_value": "paid",
+        "description": "Status pembayaran diubah: unpaid → paid",
+        "metadata": null,
+        "created_by": "usr_xxx",
+        "created_at": "2026-06-16 10:30:00"
+      },
+      {
+        "log_id": "plog_def456",
+        "event_type": "followup_logged",
+        "reference_type": "follow_up_logs",
+        "reference_id": "fu_6849abc",
+        "old_value": null,
+        "new_value": null,
+        "description": "Follow-up dicatat via whatsapp: customer_confirmed",
+        "metadata": null,
+        "created_by": "usr_xxx",
+        "created_at": "2026-06-15 09:00:00"
+      },
+      {
+        "log_id": "plog_ghi789",
+        "event_type": "endorsement",
+        "reference_type": "policy_coverages",
+        "reference_id": "cov_6849xyz",
+        "old_value": null,
+        "new_value": null,
+        "description": "Endorsemen: item pertanggungan ditambahkan — bangunan (Stok 1)",
+        "metadata": {
+          "coverage_type": "bangunan",
+          "sum_insured": 500000000,
+          "rate_permille": 2.28,
+          "premium_amount": 1140000
+        },
+        "created_by": "usr_xxx",
+        "created_at": "2026-06-14 14:00:00"
+      },
+      {
+        "log_id": "plog_jkl012",
+        "event_type": "endorsement",
+        "reference_type": null,
+        "reference_id": null,
+        "old_value": null,
+        "new_value": null,
+        "description": "Endorsemen: uang pertanggungan, premi",
+        "metadata": {
+          "before": { "sum_insured": 300000000, "premium_amount": 4500000 },
+          "after":  { "sum_insured": 350000000, "premium_amount": 5000000 }
+        },
+        "created_by": "usr_xxx",
+        "created_at": "2026-06-13 11:00:00"
+      },
+      {
+        "log_id": "plog_mno345",
+        "event_type": "renewal_status_changed",
+        "reference_type": null,
+        "reference_id": null,
+        "old_value": "pending",
+        "new_value": "renewed",
+        "description": "Status renewal diubah: pending → renewed",
+        "metadata": null,
+        "created_by": "usr_xxx",
+        "created_at": "2026-06-12 08:00:00"
+      },
+      {
+        "log_id": "plog_pqr678",
+        "event_type": "policy_created",
+        "reference_type": null,
+        "reference_id": null,
+        "old_value": null,
+        "new_value": null,
+        "description": "Polis dibuat",
+        "metadata": null,
+        "created_by": "usr_xxx",
+        "created_at": "2026-06-10 09:00:00"
+      }
+    ],
+    "pagination": {
+      "total": 6,
+      "page": 1,
+      "limit": 20,
+      "total_pages": 1
+    }
+  }
+}
+```
+
+**`event_type` values:**
+
+| Value | Triggered by | `old_value` / `new_value` |
+|---|---|---|
+| `policy_created` | `POST /policies` — also auto-creates commission record | — |
+| `policy_updated` | `PUT /policies/{id}` (non-financial fields only) | — |
+| `endorsement` | `PUT /policies/{id}` (financial/date fields) or any `coverages` write — also auto-syncs commission | — |
+| `payment_status_changed` | `PATCH /policies/{id}/payment-status` | e.g. `unpaid` → `paid` |
+| `renewal_status_changed` | `PATCH /policies/{id}/renewal-status` | e.g. `pending` → `renewed` |
+| `followup_logged` | `POST /policies/{id}/follow-ups` | — |
+
+**`reference_type` values** (when set, `reference_id` is the PK of the linked row):
+
+| Value | Points to |
+|---|---|
+| `follow_up_logs` | The specific follow-up row |
+| `policy_coverages` | The specific coverage item added / updated / deleted |
+
+**`metadata`** is a JSON object present only on events that carry a before/after snapshot or structured detail:
+- `endorsement` via `PUT /policies/{id}` → `{ "before": { ... }, "after": { ... } }` (only changed fields)
+- `endorsement` via coverage add → `{ "coverage_type", "sum_insured", "rate_permille", "premium_amount" }`
+- `endorsement` via coverage update → `{ "before": { "sum_insured", "rate_permille" }, "after": { ... } }`
+- `endorsement` via coverage delete → snapshot of the deleted row
 
 ---
 
@@ -1028,7 +1247,6 @@ These routes return `501 Not Implemented`:
 | Endpoint | Description |
 |---|---|
 | `/api/v1/services` | Services/products catalog |
-| `/api/v1/comissions` | Commission management |
 
 ---
 
@@ -1315,3 +1533,203 @@ Returns policies expiring within the next 7 days that still have `renewal_status
 | `last_follow_up_status` | Most recent status from `follow_up_logs` for this policy |
 | `total_today` | Count of policies expiring today |
 | `total_week` | Count of policies expiring within 7 days |
+
+---
+
+## Commissions Management
+
+> **Base path:** `/api/v1/commissions`
+> **Note:** This is separate from `/api/v1/comissions` which manages *insurer commission rate tables*. This module manages actual commission records per policy.
+
+A `commissions` row is auto-created every time a policy is created (see [6.2 Create Policy](#62-create-policy)) and stays in sync when premium/rate changes via endorsement. The lifecycle is:
+
+```
+pending  →  received      (when |received_amount − expected_amount| ≤ 1 IDR)
+         →  discrepancy   (when difference > 1 IDR)
+```
+
+---
+
+### CM-001 — List Commissions
+
+**GET** `/api/v1/commissions`
+
+Returns all commission records for the authenticated company, with policy and customer context.
+
+**Query Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `insurer_id` | string | — | Filter by insurer |
+| `status` | string | — | `pending` \| `received` \| `discrepancy` \| `cancelled` |
+| `commission_type` | string | — | `direct` \| `override` |
+| `month` | string | — | Format `YYYY-MM` — filters by `coverage_start` month |
+| `page` | int | 1 | Page number |
+| `limit` | int | 10 | Items per page (max 100) |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Commissions found",
+  "data": {
+    "data": [
+      {
+        "commission_id": "com_abc123",
+        "policy_id": "pol_xyz",
+        "insurer_id": "ins_001",
+        "commission_type": "direct",
+        "premium_amount": 5000000,
+        "commission_rate": 10,
+        "expected_amount": 500000,
+        "received_amount": 0,
+        "status": "pending",
+        "expected_date": null,
+        "received_date": null,
+        "reference_number": null,
+        "discrepancy_notes": null,
+        "marked_by": null,
+        "marked_at": null,
+        "created_at": "2025-06-01 09:00:00",
+        "updated_at": "2025-06-01 09:00:00",
+        "policy_number": "01/08/FIRE/2025",
+        "product_type": "fire",
+        "coverage_start": "2025-06-01",
+        "coverage_end": "2026-06-01",
+        "customer_name": "PT Maju Bersama",
+        "insurer_name": "Chubb Insurance",
+        "insurer_short_name": "Chubb"
+      }
+    ],
+    "pagination": {
+      "total": 42,
+      "page": 1,
+      "limit": 10,
+      "total_pages": 5
+    }
+  }
+}
+```
+
+---
+
+### CM-002 — Commission Summary
+
+**GET** `/api/v1/commissions/summary`
+
+Returns aggregated commission totals grouped by status. Useful for the commission overview/dashboard card.
+
+**Query Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `insurer_id` | string | — | Filter by insurer |
+| `month` | string | — | Format `YYYY-MM` — filters by `coverage_start` month |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Commission summary retrieved",
+  "data": {
+    "total_count": 42,
+    "total_expected": 21000000,
+    "pending": {
+      "count": 30,
+      "amount": 15000000
+    },
+    "received": {
+      "count": 10,
+      "amount": 5000000
+    },
+    "discrepancy": {
+      "count": 2,
+      "expected": 1000000,
+      "received": 850000
+    }
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `total_expected` | Sum of `expected_amount` across all statuses |
+| `pending.amount` | Sum of `expected_amount` for pending rows |
+| `received.amount` | Sum of `received_amount` for received rows |
+| `discrepancy.expected` | What was expected for discrepancy rows |
+| `discrepancy.received` | What was actually received for discrepancy rows |
+
+---
+
+### CM-003 — Get Commission Detail
+
+**GET** `/api/v1/commissions/{commission_id}`
+
+Returns a single commission record with full policy, customer, and insurer context.
+
+**Response `200`:** Same fields as a single item in CM-001.
+
+**Response `404`:** Commission not found or does not belong to the company.
+
+---
+
+### CM-004 — Mark Commission as Received
+
+**PATCH** `/api/v1/commissions/{commission_id}/mark-received`
+
+Records the actual received amount from the insurer. Automatically sets status to `received` or `discrepancy` based on the difference.
+
+**Request Body:**
+```json
+{
+  "received_amount": 500000,
+  "received_date": "2025-06-15",
+  "reference_number": "INV/2025/06/001",
+  "discrepancy_notes": "Insurer deducted admin fee"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `received_amount` | int | **Yes** | Actual amount received in IDR |
+| `received_date` | string | No | Date received `YYYY-MM-DD` (defaults to today) |
+| `reference_number` | string | No | Bank transfer / invoice reference |
+| `discrepancy_notes` | string | No | Explanation if there is a difference |
+
+**Status Logic:**
+```
+|received_amount − expected_amount| ≤ 1  →  status = "received"
+|received_amount − expected_amount| > 1  →  status = "discrepancy"
+```
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Commission marked as received",
+  "data": {
+    "commission_id": "com_abc123",
+    "status": "received",
+    "expected_amount": 500000,
+    "received_amount": 500000,
+    "difference": 0
+  }
+}
+```
+
+**Response `200` (discrepancy):**
+```json
+{
+  "status_code": 200,
+  "status_message": "Commission marked as discrepancy",
+  "data": {
+    "commission_id": "com_abc123",
+    "status": "discrepancy",
+    "expected_amount": 500000,
+    "received_amount": 450000,
+    "difference": -50000
+  }
+}
+```
+
+> This action also writes an entry to `policy_logs` with event type `commission_marked_received` or `commission_discrepancy`, visible in `GET /api/v1/policies/{id}/logs`.

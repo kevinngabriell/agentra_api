@@ -2,6 +2,8 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/policy_log.php';
+require_once __DIR__ . '/../helpers/commission.php';
 
 // Looks up commission rate from master_products.
 // Matches first by product_code (= product_type), then by policy number prefix via policy_prefixes.
@@ -211,6 +213,8 @@ function createPolicy($conn, $input, $username, $company_id){
          $commission_rate, $commission_amount, $notes, '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
+        insertCommission($conn, $policy_id, $company_id, $insurer_id, $premium_amount, $commission_rate, $commission_amount, $issuing_agent_id !== 'NULL' ? $input['issuing_agent_id'] ?? null : null);
+        insertPolicyLog($conn, $policy_id, $company_id, 'policy_created', 'Polis dibuat', $username);
         jsonResponse(201, 'Policy created successfully', ['policy_id' => $policy_id]);
     } else {
         jsonResponse(500, 'Failed to create policy', ['error' => mysqli_error($conn)]);
@@ -252,7 +256,10 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
-    $check = mysqli_query($conn, "SELECT premium_amount, commission_rate FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    $check = mysqli_query($conn,
+        "SELECT premium_amount, commission_rate, object_insured, sum_insured,
+                coverage_notes, coverage_start, coverage_end, notes
+         FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
         return;
@@ -318,6 +325,44 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     $updates[] = "updated_at = '$now'";
 
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET " . implode(', ', $updates) . " WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
+        // Determine event type: endorsement when financial or date fields change
+        $financial_keys = ['sum_insured', 'premium_amount', 'commission_rate', 'coverage_start', 'coverage_end'];
+        $is_endorsement = (bool)array_intersect($financial_keys, array_keys($input));
+        $event_type     = $is_endorsement ? 'endorsement' : 'policy_updated';
+
+        $changed_labels = [];
+        $before = [];
+        $after  = [];
+        $label_map = [
+            'object_insured'  => 'objek pertanggungan',
+            'sum_insured'     => 'uang pertanggungan',
+            'coverage_notes'  => 'catatan pertanggungan',
+            'coverage_start'  => 'mulai pertanggungan',
+            'coverage_end'    => 'akhir pertanggungan',
+            'premium_amount'  => 'premi',
+            'commission_rate' => 'rate komisi',
+            'notes'           => 'catatan',
+        ];
+        foreach ($label_map as $field => $label) {
+            if (isset($input[$field])) {
+                $changed_labels[] = $label;
+                $before[$field]   = $current[$field] ?? null;
+                $after[$field]    = $input[$field];
+            }
+        }
+        $desc = ($is_endorsement ? 'Endorsemen' : 'Polis diperbarui')
+            . (!empty($changed_labels) ? ': ' . implode(', ', $changed_labels) : '');
+
+        insertPolicyLog($conn, $policy_id, $company_id, $event_type, $desc, $username,
+            null, null, null, null, ['before' => $before, 'after' => $after]);
+
+        if ($new_premium !== null || $new_rate !== null) {
+            $final_premium = $new_premium ?? (int)$current['premium_amount'];
+            $final_rate    = $new_rate    ?? (float)$current['commission_rate'];
+            $final_amount  = (int)round($final_premium * $final_rate / 100);
+            syncCommission($conn, $policy_id, $final_premium, $final_rate, $final_amount);
+        }
+
         jsonResponse(200, 'Policy updated successfully');
     } else {
         jsonResponse(500, 'Failed to update policy', ['error' => mysqli_error($conn)]);
@@ -339,14 +384,17 @@ function updateRenewalStatus($conn, $policy_id, $company_id, $input, $username){
         return;
     }
 
-    $check = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    $check = mysqli_query($conn, "SELECT renewal_status FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
         return;
     }
+    $old_status = mysqli_fetch_assoc($check)['renewal_status'];
 
     $now = date('Y-m-d H:i:s');
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET renewal_status = '$status', updated_by = '$username', updated_at = '$now' WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
+        insertPolicyLog($conn, $policy_id, $company_id, 'renewal_status_changed',
+            "Status renewal diubah: $old_status → $status", $username, $old_status, $status);
         jsonResponse(200, 'Renewal status updated successfully');
     } else {
         jsonResponse(500, 'Failed to update renewal status', ['error' => mysqli_error($conn)]);
@@ -390,6 +438,10 @@ function addFollowUp($conn, $policy_id, $company_id, $input, $username){
         VALUES ('$followup_id', '$policy_id', '$followup_status', $channel_sql, $notes_sql, '$followup_date', '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
+        $channel_label = $channel !== '' ? " via $channel" : '';
+        insertPolicyLog($conn, $policy_id, $company_id, 'followup_logged',
+            "Follow-up dicatat{$channel_label}: $followup_status", $username,
+            null, null, 'follow_up_logs', $followup_id);
         jsonResponse(201, 'Follow-up logged successfully', ['followup_id' => $followup_id]);
     } else {
         jsonResponse(500, 'Failed to log follow-up', ['error' => mysqli_error($conn)]);
@@ -411,14 +463,17 @@ function updatePaymentStatus($conn, $policy_id, $company_id, $input, $username){
         return;
     }
 
-    $check = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    $check = mysqli_query($conn, "SELECT payment_status FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
         return;
     }
+    $old_status = mysqli_fetch_assoc($check)['payment_status'];
 
     $now = date('Y-m-d H:i:s');
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET payment_status = '$status', updated_by = '$username', updated_at = '$now' WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
+        insertPolicyLog($conn, $policy_id, $company_id, 'payment_status_changed',
+            "Status pembayaran diubah: $old_status → $status", $username, $old_status, $status);
         jsonResponse(200, 'Payment status updated successfully');
     } else {
         jsonResponse(500, 'Failed to update payment status', ['error' => mysqli_error($conn)]);
@@ -493,6 +548,87 @@ function getPaymentSummary($conn, $company_id, $params){
     ]);
 }
 
+// --- GET COMMISSION (PO-009) ---
+function getCommission($conn, $policy_id, $company_id) {
+    if (!$policy_id) {
+        jsonResponse(400, 'policy_id is required');
+        return;
+    }
+
+    $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
+    $check = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Policy not found');
+        return;
+    }
+
+    $result = mysqli_query($conn,
+        "SELECT cm.*,
+                i.name         AS insurer_name,
+                i.short_name   AS insurer_short_name,
+                p.policy_number, p.product_type, p.coverage_start, p.coverage_end
+         FROM " . APP_SCHEMA . ".commissions cm
+         LEFT JOIN " . APP_SCHEMA . ".insurers  i ON i.insurer_id  = cm.insurer_id
+         LEFT JOIN " . APP_SCHEMA . ".policies   p ON p.policy_id   = cm.policy_id
+         WHERE cm.policy_id = '$policy_id'
+         LIMIT 1"
+    );
+
+    if (!$result || mysqli_num_rows($result) === 0) {
+        jsonResponse(404, 'No commission record found for this policy');
+        return;
+    }
+
+    jsonResponse(200, 'Commission found', mysqli_fetch_assoc($result));
+}
+
+// --- GET POLICY LOGS (PO-010) ---
+function getPolicyLogs($conn, $policy_id, $company_id, $params) {
+    if (!$policy_id) {
+        jsonResponse(400, 'policy_id is required');
+        return;
+    }
+
+    $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
+    $check = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Policy not found');
+        return;
+    }
+
+    $page   = max(1, (int)($params['page']  ?? 1));
+    $limit  = min(100, max(1, (int)($params['limit'] ?? 20)));
+    $offset = ($page - 1) * $limit;
+
+    $result = mysqli_query($conn,
+        "SELECT log_id, event_type, reference_type, reference_id,
+                old_value, new_value, description, metadata, created_by, created_at
+         FROM " . APP_SCHEMA . ".policy_logs
+         WHERE policy_id = '$policy_id'
+         ORDER BY created_at DESC
+         LIMIT $limit OFFSET $offset"
+    );
+
+    $countResult = mysqli_query($conn,
+        "SELECT COUNT(*) AS total FROM " . APP_SCHEMA . ".policy_logs WHERE policy_id = '$policy_id'"
+    );
+
+    $total = $countResult ? (int)mysqli_fetch_assoc($countResult)['total'] : 0;
+    $data  = $result ? mysqli_fetch_all($result, MYSQLI_ASSOC) : [];
+
+    jsonResponse(200, 'Policy logs retrieved', [
+        'data'       => $data,
+        'pagination' => [
+            'total'       => $total,
+            'page'        => $page,
+            'limit'       => $limit,
+            'total_pages' => $limit > 0 ? (int)ceil($total / $limit) : 0,
+        ],
+    ]);
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 $authUser   = requireAuth();
@@ -539,6 +675,14 @@ try {
                 break;
             case 'coverages':
                 require __DIR__ . '/coverages.php';
+                break;
+            case 'commission':
+                if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+                getCommission($conn, $policy_id, $company_id);
+                break;
+            case 'logs':
+                if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+                getPolicyLogs($conn, $policy_id, $company_id, $_GET);
                 break;
             default:
                 jsonResponse(404, 'Route not found');

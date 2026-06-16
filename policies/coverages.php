@@ -2,18 +2,35 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/policy_log.php';
 
 const COVERAGE_TYPES = ['bangunan', 'stok', 'invenisi', 'mesin', 'dll'];
 
-// Recomputes sum_insured and premium_amount on the parent policy from its coverages
+// Recomputes sum_insured, premium_amount, and commission_amount on the parent policy from its coverages.
+// Also syncs the pending commission record so expected_amount stays accurate.
 function syncPolicyTotals($conn, $policy_id) {
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
     mysqli_query($conn,
         "UPDATE " . APP_SCHEMA . ".policies p
          SET
-           p.sum_insured    = COALESCE((SELECT SUM(c.sum_insured)    FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0),
-           p.premium_amount = COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0)
+           p.sum_insured       = COALESCE((SELECT SUM(c.sum_insured)    FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0),
+           p.premium_amount    = COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0),
+           p.commission_amount = ROUND(
+             COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0)
+             * p.commission_rate / 100
+           )
          WHERE p.policy_id = '$policy_id'"
+    );
+
+    // Keep the commissions record in sync with the updated policy totals
+    mysqli_query($conn,
+        "UPDATE " . APP_SCHEMA . ".commissions cm
+         JOIN  " . APP_SCHEMA . ".policies p ON p.policy_id = cm.policy_id
+         SET cm.premium_amount  = p.premium_amount,
+             cm.expected_amount = p.commission_amount,
+             cm.updated_at      = NOW()
+         WHERE cm.policy_id = '$policy_id' AND cm.status = 'pending'"
     );
 }
 
@@ -105,6 +122,13 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
 
     if (mysqli_query($conn, $sql)) {
         syncPolicyTotals($conn, $policy_id);
+        $label_text = isset($input['coverage_label']) && trim($input['coverage_label']) !== ''
+            ? ' (' . trim($input['coverage_label']) . ')' : '';
+        insertPolicyLog($conn, $policy_id, $company_id, 'endorsement',
+            "Endorsemen: item pertanggungan ditambahkan — {$coverage_type}{$label_text}", $username,
+            null, null, 'policy_coverages', $coverage_id,
+            ['coverage_type' => $coverage_type, 'sum_insured' => $sum_insured,
+             'rate_permille' => (float)$rate_permille, 'premium_amount' => $premium_amount]);
         jsonResponse(201, 'Coverage item added', ['coverage_id' => $coverage_id, 'premium_amount' => $premium_amount]);
     } else {
         jsonResponse(500, 'Failed to add coverage', ['error' => mysqli_error($conn)]);
@@ -175,6 +199,12 @@ function updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $com
 
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policy_coverages SET " . implode(', ', $updates) . " WHERE coverage_id = '$coverage_id'")) {
         syncPolicyTotals($conn, $policy_id);
+        $before = ['sum_insured' => (int)$current['sum_insured'], 'rate_permille' => (float)$current['rate_permille']];
+        $after  = ['sum_insured' => $final_sum, 'rate_permille' => (float)$final_rate, 'premium_amount' => $premium];
+        insertPolicyLog($conn, $policy_id, $company_id, 'endorsement',
+            'Endorsemen: item pertanggungan diperbarui', $username,
+            null, null, 'policy_coverages', $coverage_id,
+            ['before' => $before, 'after' => $after]);
         jsonResponse(200, 'Coverage item updated', ['premium_amount' => $premium]);
     } else {
         jsonResponse(500, 'Failed to update coverage', ['error' => mysqli_error($conn)]);
@@ -182,13 +212,14 @@ function updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $com
 }
 
 // --- DELETE a coverage item ---
-function deleteCoverage($conn, $policy_id, $coverage_id, $company_id) {
+function deleteCoverage($conn, $policy_id, $coverage_id, $company_id, $username) {
     $policy_id   = mysqli_real_escape_string($conn, $policy_id);
     $coverage_id = mysqli_real_escape_string($conn, $coverage_id);
     $company_id  = mysqli_real_escape_string($conn, $company_id);
 
     $check = mysqli_query($conn,
-        "SELECT c.coverage_id FROM " . APP_SCHEMA . ".policy_coverages c
+        "SELECT c.coverage_type, c.coverage_label, c.sum_insured, c.premium_amount
+         FROM " . APP_SCHEMA . ".policy_coverages c
          JOIN " . APP_SCHEMA . ".policies p ON p.policy_id = c.policy_id
          WHERE c.coverage_id = '$coverage_id' AND c.policy_id = '$policy_id' AND p.company_id = '$company_id'
          LIMIT 1"
@@ -197,9 +228,16 @@ function deleteCoverage($conn, $policy_id, $coverage_id, $company_id) {
         jsonResponse(404, 'Coverage item not found');
         return;
     }
+    $cov = mysqli_fetch_assoc($check);
 
     if (mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".policy_coverages WHERE coverage_id = '$coverage_id'")) {
         syncPolicyTotals($conn, $policy_id);
+        $label_text = $cov['coverage_label'] ? ' (' . $cov['coverage_label'] . ')' : '';
+        insertPolicyLog($conn, $policy_id, $company_id, 'endorsement',
+            "Endorsemen: item pertanggungan dihapus — {$cov['coverage_type']}{$label_text}", $username,
+            null, null, 'policy_coverages', $coverage_id,
+            ['coverage_type' => $cov['coverage_type'], 'coverage_label' => $cov['coverage_label'],
+             'sum_insured' => (int)$cov['sum_insured'], 'premium_amount' => (int)$cov['premium_amount']]);
         jsonResponse(200, 'Coverage item deleted');
     } else {
         jsonResponse(500, 'Failed to delete coverage', ['error' => mysqli_error($conn)]);
@@ -231,7 +269,7 @@ try {
                 updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $company_id);
                 break;
             case 'DELETE':
-                deleteCoverage($conn, $policy_id, $coverage_id, $company_id);
+                deleteCoverage($conn, $policy_id, $coverage_id, $company_id, $username);
                 break;
             default:
                 jsonResponse(405, 'Method Not Allowed');
