@@ -8,7 +8,8 @@ function getAllMasterProducts($conn, $company_id) {
     $company_id = mysqli_real_escape_string($conn, $company_id);
 
     $result = mysqli_query($conn,
-        "SELECT product_id, product_code, product_name, commission_rate, policy_prefixes, is_active,
+        "SELECT product_id, product_code, product_name, commission_rate,
+                default_tax_rate, policy_prefixes, is_active,
                 created_by, created_at, updated_by, updated_at
          FROM " . APP_SCHEMA . ".master_products
          WHERE company_id = '$company_id'
@@ -31,8 +32,8 @@ function createMasterProduct($conn, $input, $username, $company_id) {
         }
     }
 
-    $product_code = strtolower(trim(mysqli_real_escape_string($conn, $input['product_code'])));
-    $product_name = trim(mysqli_real_escape_string($conn, $input['product_name']));
+    $product_code    = strtolower(trim(mysqli_real_escape_string($conn, $input['product_code'])));
+    $product_name    = trim(mysqli_real_escape_string($conn, $input['product_name']));
     $commission_rate = $input['commission_rate'];
 
     if (!is_numeric($commission_rate) || $commission_rate < 0 || $commission_rate > 100) {
@@ -40,6 +41,18 @@ function createMasterProduct($conn, $input, $username, $company_id) {
         return;
     }
     $commission_rate = number_format((float)$commission_rate, 2, '.', '');
+
+    // [NEW v1.1] default_tax_rate: decimal 0–1 (e.g. 0.0250 = 2.5% PPh). Defaults to 0.025.
+    $default_tax_rate = 0.025;
+    if (isset($input['default_tax_rate']) && $input['default_tax_rate'] !== '') {
+        $t = (float)$input['default_tax_rate'];
+        if ($t < 0 || $t > 1) {
+            jsonResponse(400, 'default_tax_rate must be a decimal between 0 and 1 (e.g. 0.025 = 2.5%)');
+            return;
+        }
+        $default_tax_rate = $t;
+    }
+    $default_tax_rate = number_format($default_tax_rate, 4, '.', '');
 
     $policy_prefixes_sql = 'NULL';
     if (isset($input['policy_prefixes']) && trim($input['policy_prefixes']) !== '') {
@@ -59,8 +72,11 @@ function createMasterProduct($conn, $input, $username, $company_id) {
     $now        = date('Y-m-d H:i:s');
 
     $sql = "INSERT INTO " . APP_SCHEMA . ".master_products
-                (product_id, company_id, product_code, product_name, commission_rate, policy_prefixes, created_by, created_at)
-            VALUES ('$product_id', '$company_id', '$product_code', '$product_name', $commission_rate, $policy_prefixes_sql, '$username', '$now')";
+                (product_id, company_id, product_code, product_name,
+                 commission_rate, default_tax_rate, policy_prefixes, created_by, created_at)
+            VALUES
+                ('$product_id', '$company_id', '$product_code', '$product_name',
+                 $commission_rate, $default_tax_rate, $policy_prefixes_sql, '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
         jsonResponse(201, 'Master product created', ['product_id' => $product_id]);
@@ -75,7 +91,8 @@ function getMasterProductDetail($conn, $product_id, $company_id) {
     $company_id = mysqli_real_escape_string($conn, $company_id);
 
     $result = mysqli_query($conn,
-        "SELECT product_id, product_code, product_name, commission_rate, policy_prefixes, is_active,
+        "SELECT product_id, product_code, product_name, commission_rate,
+                default_tax_rate, policy_prefixes, is_active,
                 created_by, created_at, updated_by, updated_at
          FROM " . APP_SCHEMA . ".master_products
          WHERE product_id = '$product_id' AND company_id = '$company_id' LIMIT 1"
@@ -132,6 +149,16 @@ function updateMasterProduct($conn, $product_id, $input, $username, $company_id)
             return;
         }
         $updates[] = "commission_rate = " . number_format((float)$rate, 2, '.', '');
+    }
+
+    // [NEW v1.1] Update default PPh rate for this product type.
+    if (isset($input['default_tax_rate']) && $input['default_tax_rate'] !== '') {
+        $t = (float)$input['default_tax_rate'];
+        if ($t < 0 || $t > 1) {
+            jsonResponse(400, 'default_tax_rate must be a decimal between 0 and 1 (e.g. 0.025 = 2.5%)');
+            return;
+        }
+        $updates[] = "default_tax_rate = " . number_format($t, 4, '.', '');
     }
 
     if (array_key_exists('policy_prefixes', $input)) {

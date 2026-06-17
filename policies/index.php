@@ -5,33 +5,41 @@ require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
 require_once __DIR__ . '/../helpers/commission.php';
 
-// Looks up commission rate from master_products.
+// Looks up commission rate and tax rate from master_products.
 // Matches first by product_code (= product_type), then by policy number prefix via policy_prefixes.
-// Returns ['rate' => float, 'product_name' => string] or null if no match.
+// [NEW v1.1] Returns ['rate' => float, 'tax_rate' => float, 'product_name' => string] or null if no match.
 function resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number) {
     $company_id   = mysqli_real_escape_string($conn, $company_id);
     $product_code = strtolower(trim(mysqli_real_escape_string($conn, $product_type)));
 
     $res = mysqli_query($conn,
-        "SELECT commission_rate, product_name FROM " . APP_SCHEMA . ".master_products
+        "SELECT commission_rate, default_tax_rate, product_name FROM " . APP_SCHEMA . ".master_products
          WHERE company_id = '$company_id' AND product_code = '$product_code' AND is_active = 1 LIMIT 1"
     );
     if ($res && mysqli_num_rows($res) > 0) {
         $row = mysqli_fetch_assoc($res);
-        return ['rate' => (float)$row['commission_rate'], 'product_name' => $row['product_name']];
+        return [
+            'rate'         => (float)$row['commission_rate'],
+            'tax_rate'     => (float)$row['default_tax_rate'],
+            'product_name' => $row['product_name'],
+        ];
     }
 
     // Fall back: match by policy number prefix stored in policy_prefixes
     $prefix = substr(preg_replace('/\s+/', '', $policy_number), 0, 2);
     $prefix = mysqli_real_escape_string($conn, $prefix);
     $res = mysqli_query($conn,
-        "SELECT commission_rate, product_name FROM " . APP_SCHEMA . ".master_products
+        "SELECT commission_rate, default_tax_rate, product_name FROM " . APP_SCHEMA . ".master_products
          WHERE company_id = '$company_id' AND is_active = 1
          AND FIND_IN_SET('$prefix', REPLACE(policy_prefixes, ' ', '')) > 0 LIMIT 1"
     );
     if ($res && mysqli_num_rows($res) > 0) {
         $row = mysqli_fetch_assoc($res);
-        return ['rate' => (float)$row['commission_rate'], 'product_name' => $row['product_name']];
+        return [
+            'rate'         => (float)$row['commission_rate'],
+            'tax_rate'     => (float)$row['default_tax_rate'],
+            'product_name' => $row['product_name'],
+        ];
     }
 
     return null;
@@ -77,7 +85,11 @@ function getAllPolicies($conn, $company_id, $params){
     $query = "SELECT p.policy_id, p.policy_number, p.product_type, p.policy_year,
                 p.renewal_status, p.payment_status,
                 p.coverage_start, p.coverage_end,
-                p.sum_insured, p.premium_amount, p.commission_rate, p.commission_amount,
+                p.sum_insured, p.premium_amount, p.materai_amount,
+                p.commission_rate, p.commission_amount,
+                p.commission_tax_rate, p.commission_tax_amount,
+                p.net_commission_amount, p.customer_premium_amount,
+                p.is_coassurance,
                 p.customer_id, c.display_name AS customer_name,
                 p.insurer_id, i.short_name AS insurer_short_name,
                 p.issuing_agent_id, p.created_at
@@ -152,17 +164,45 @@ function createPolicy($conn, $input, $username, $company_id){
     $sum_insured    = (int)$input['sum_insured'];
     $premium_amount = (int)$input['premium_amount'];
 
+    // Always resolve master product to get both commission rate and default tax rate.
+    $resolved = resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number);
+
     if (isset($input['commission_rate']) && $input['commission_rate'] !== '') {
         $commission_rate = round((float)$input['commission_rate'], 2);
+    } elseif ($resolved !== null) {
+        $commission_rate = $resolved['rate'];
     } else {
-        $resolved = resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number);
-        if ($resolved === null) {
-            jsonResponse(400, 'commission_rate is required: no commission rule found for this product type or policy number prefix');
+        jsonResponse(400, 'commission_rate is required: no commission rule found for this product type or policy number prefix');
+        return;
+    }
+
+    // [NEW v1.1] Tax rate: explicit input overrides master product default.
+    // Input as decimal 0–1 (e.g. 0.025 = 2.5% PPh). Defaults to master product value or 0.
+    if (isset($input['commission_tax_rate']) && $input['commission_tax_rate'] !== '') {
+        $commission_tax_rate = round((float)$input['commission_tax_rate'], 4);
+        if ($commission_tax_rate < 0 || $commission_tax_rate > 1) {
+            jsonResponse(400, 'commission_tax_rate must be a decimal between 0 and 1 (e.g. 0.025 = 2.5%)');
             return;
         }
-        $commission_rate = $resolved['rate'];
+    } else {
+        $commission_tax_rate = $resolved ? round((float)$resolved['tax_rate'], 4) : 0.0;
     }
-    $commission_amount = (int)round($premium_amount * $commission_rate / 100);
+
+    // [NEW v1.1] Materai: stamp duty in IDR, per-policy, optional.
+    $materai_amount = isset($input['materai_amount']) ? max(0, (int)$input['materai_amount']) : 0;
+
+    // Derived commission breakdown:
+    //   commission_amount      = premium × rate / 100            (gross, before tax)
+    //   commission_tax_amount  = commission_amount × tax_rate    (PPh withheld)
+    //   net_commission_amount  = commission_amount − tax_amount  (agent nets this)
+    //   customer_premium_amount = premium + materai − commission (billed to customer)
+    $commission_amount       = (int)round($premium_amount * $commission_rate / 100);
+    $commission_tax_amount   = (int)round($commission_amount * $commission_tax_rate);
+    $net_commission_amount   = $commission_amount - $commission_tax_amount;
+    $customer_premium_amount = $premium_amount + $materai_amount - $commission_amount;
+
+    // [NEW v1.1] Co-assurance flag: FE sets this to true when adding co-insurers after creation.
+    $is_coassurance = !empty($input['is_coassurance']) ? 1 : 0;
 
     // Unique policy number per company
     $dup = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE company_id = '$company_id' AND policy_number = '$policy_number' LIMIT 1");
@@ -204,16 +244,24 @@ function createPolicy($conn, $input, $username, $company_id){
     $sql = "INSERT INTO " . APP_SCHEMA . ".policies
         (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
          product_type, policy_year, previous_policy_id, object_insured, sum_insured, coverage_notes,
-         coverage_start, coverage_end, premium_amount, renewal_status, payment_status,
-         commission_rate, commission_amount, notes, created_by, created_at)
+         coverage_start, coverage_end,
+         premium_amount, materai_amount,
+         renewal_status, payment_status,
+         commission_rate, commission_amount,
+         commission_tax_rate, commission_tax_amount, net_commission_amount, customer_premium_amount,
+         is_coassurance, notes, created_by, created_at)
         VALUES
         ('$policy_id', '$company_id', '$insurer_id', '$customer_id', $issuing_agent_id, '$policy_number', $agent_code_used,
          '$product_type', $policy_year, $previous_policy_id, $object_insured, $sum_insured, $coverage_notes,
-         '$coverage_start', '$coverage_end', $premium_amount, 'pending', 'unpaid',
-         $commission_rate, $commission_amount, $notes, '$username', '$now')";
+         '$coverage_start', '$coverage_end',
+         $premium_amount, $materai_amount,
+         'pending', 'unpaid',
+         $commission_rate, $commission_amount,
+         $commission_tax_rate, $commission_tax_amount, $net_commission_amount, $customer_premium_amount,
+         $is_coassurance, $notes, '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
-        insertCommission($conn, $policy_id, $company_id, $insurer_id, $premium_amount, $commission_rate, $commission_amount, $issuing_agent_id !== 'NULL' ? $input['issuing_agent_id'] ?? null : null);
+        insertCommission($conn, $policy_id, $company_id, $insurer_id, $premium_amount, $commission_rate, $commission_amount, $issuing_agent_id !== 'NULL' ? $input['issuing_agent_id'] ?? null : null, $commission_tax_rate);
         insertPolicyLog($conn, $policy_id, $company_id, 'policy_created', 'Polis dibuat', $username);
         jsonResponse(201, 'Policy created successfully', ['policy_id' => $policy_id]);
     } else {
@@ -257,8 +305,8 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
     $check = mysqli_query($conn,
-        "SELECT premium_amount, commission_rate, object_insured, sum_insured,
-                coverage_notes, coverage_start, coverage_end, notes
+        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount,
+                object_insured, sum_insured, coverage_notes, coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
@@ -300,19 +348,32 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         $updates[] = "notes = " . ($val !== '' ? "'$val'" : 'NULL');
     }
 
-    $new_premium = isset($input['premium_amount']) ? (int)$input['premium_amount'] : null;
-    $new_rate    = isset($input['commission_rate']) ? round((float)$input['commission_rate'], 2) : null;
+    $new_premium  = isset($input['premium_amount'])      ? (int)$input['premium_amount']                      : null;
+    $new_rate     = isset($input['commission_rate'])     ? round((float)$input['commission_rate'], 2)           : null;
+    // [NEW v1.1] materai and tax rate are updatable; trigger a full commission breakdown recalc.
+    $new_materai  = isset($input['materai_amount'])      ? max(0, (int)$input['materai_amount'])                : null;
+    $new_tax_rate = isset($input['commission_tax_rate']) ? round((float)$input['commission_tax_rate'], 4)       : null;
 
-    if ($new_premium !== null) {
-        $updates[] = "premium_amount = $new_premium";
-    }
-    if ($new_rate !== null) {
-        $updates[] = "commission_rate = $new_rate";
-    }
-    if ($new_premium !== null || $new_rate !== null) {
-        $premium   = $new_premium ?? (int)$current['premium_amount'];
-        $rate      = $new_rate    ?? (float)$current['commission_rate'];
-        $updates[] = "commission_amount = " . (int)round($premium * $rate / 100);
+    if ($new_premium !== null)  { $updates[] = "premium_amount = $new_premium"; }
+    if ($new_rate    !== null)  { $updates[] = "commission_rate = $new_rate"; }
+    if ($new_materai !== null)  { $updates[] = "materai_amount = $new_materai"; }
+    if ($new_tax_rate !== null) { $updates[] = "commission_tax_rate = $new_tax_rate"; }
+
+    if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
+        $premium  = $new_premium  ?? (int)$current['premium_amount'];
+        $rate     = $new_rate     ?? (float)$current['commission_rate'];
+        $materai  = $new_materai  ?? (int)$current['materai_amount'];
+        $tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+
+        $comm_amount  = (int)round($premium * $rate / 100);
+        $tax_amount   = (int)round($comm_amount * $tax_rate);
+        $net_comm     = $comm_amount - $tax_amount;
+        $cust_premium = $premium + $materai - $comm_amount;
+
+        $updates[] = "commission_amount = $comm_amount";
+        $updates[] = "commission_tax_amount = $tax_amount";
+        $updates[] = "net_commission_amount = $net_comm";
+        $updates[] = "customer_premium_amount = $cust_premium";
     }
 
     if (empty($updates)) {
@@ -326,7 +387,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET " . implode(', ', $updates) . " WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
         // Determine event type: endorsement when financial or date fields change
-        $financial_keys = ['sum_insured', 'premium_amount', 'commission_rate', 'coverage_start', 'coverage_end'];
+        $financial_keys = ['sum_insured', 'premium_amount', 'commission_rate', 'commission_tax_rate', 'materai_amount', 'coverage_start', 'coverage_end'];
         $is_endorsement = (bool)array_intersect($financial_keys, array_keys($input));
         $event_type     = $is_endorsement ? 'endorsement' : 'policy_updated';
 
@@ -334,14 +395,16 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         $before = [];
         $after  = [];
         $label_map = [
-            'object_insured'  => 'objek pertanggungan',
-            'sum_insured'     => 'uang pertanggungan',
-            'coverage_notes'  => 'catatan pertanggungan',
-            'coverage_start'  => 'mulai pertanggungan',
-            'coverage_end'    => 'akhir pertanggungan',
-            'premium_amount'  => 'premi',
-            'commission_rate' => 'rate komisi',
-            'notes'           => 'catatan',
+            'object_insured'      => 'objek pertanggungan',
+            'sum_insured'         => 'uang pertanggungan',
+            'coverage_notes'      => 'catatan pertanggungan',
+            'coverage_start'      => 'mulai pertanggungan',
+            'coverage_end'        => 'akhir pertanggungan',
+            'premium_amount'      => 'premi',
+            'materai_amount'      => 'materai',
+            'commission_rate'     => 'rate komisi',
+            'commission_tax_rate' => 'rate pajak komisi',
+            'notes'               => 'catatan',
         ];
         foreach ($label_map as $field => $label) {
             if (isset($input[$field])) {
@@ -356,11 +419,12 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         insertPolicyLog($conn, $policy_id, $company_id, $event_type, $desc, $username,
             null, null, null, null, ['before' => $before, 'after' => $after]);
 
-        if ($new_premium !== null || $new_rate !== null) {
-            $final_premium = $new_premium ?? (int)$current['premium_amount'];
-            $final_rate    = $new_rate    ?? (float)$current['commission_rate'];
-            $final_amount  = (int)round($final_premium * $final_rate / 100);
-            syncCommission($conn, $policy_id, $final_premium, $final_rate, $final_amount);
+        if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
+            $final_premium  = $new_premium  ?? (int)$current['premium_amount'];
+            $final_rate     = $new_rate     ?? (float)$current['commission_rate'];
+            $final_tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+            $final_amount   = (int)round($final_premium * $final_rate / 100);
+            syncCommission($conn, $policy_id, $final_premium, $final_rate, $final_amount, $final_tax_rate);
         }
 
         jsonResponse(200, 'Policy updated successfully');
@@ -679,6 +743,10 @@ try {
             case 'commission':
                 if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
                 getCommission($conn, $policy_id, $company_id);
+                break;
+            // [NEW v1.1] Co-assurance participants for this policy.
+            case 'coassurance':
+                require __DIR__ . '/coassurance.php';
                 break;
             case 'logs':
                 if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }

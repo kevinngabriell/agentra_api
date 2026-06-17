@@ -28,7 +28,8 @@ function getAllCommissions($conn, $company_id, $params) {
         "SELECT
             cm.commission_id, cm.policy_id, cm.insurer_id,
             cm.commission_type, cm.premium_amount, cm.commission_rate,
-            cm.expected_amount, cm.received_amount, cm.status,
+            cm.expected_amount, cm.commission_tax_rate, cm.commission_tax_amount,
+            cm.net_expected_amount, cm.received_amount, cm.status,
             cm.expected_date, cm.received_date, cm.reference_number,
             cm.discrepancy_notes, cm.marked_by, cm.marked_at,
             cm.created_at, cm.updated_at,
@@ -127,7 +128,8 @@ function getCommissionDetail($conn, $commission_id, $company_id) {
         "SELECT
             cm.commission_id, cm.policy_id, cm.insurer_id,
             cm.commission_type, cm.premium_amount, cm.commission_rate,
-            cm.expected_amount, cm.received_amount, cm.status,
+            cm.expected_amount, cm.commission_tax_rate, cm.commission_tax_amount,
+            cm.net_expected_amount, cm.received_amount, cm.status,
             cm.expected_date, cm.received_date, cm.reference_number,
             cm.discrepancy_notes, cm.marked_by, cm.marked_at,
             cm.created_at, cm.updated_at,
