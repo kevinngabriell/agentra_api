@@ -241,9 +241,13 @@ function createPolicy($conn, $input, $username, $company_id){
     $notes              = isset($input['notes'])          && trim($input['notes'])          !== ''
                             ? "'" . mysqli_real_escape_string($conn, trim($input['notes'])) . "'"          : 'NULL';
 
+    $valid_classes       = ['I', 'II', 'III'];
+    $construction_class  = isset($input['construction_class']) && in_array(strtoupper(trim($input['construction_class'])), $valid_classes, true)
+                            ? "'" . strtoupper(trim($input['construction_class'])) . "'" : 'NULL';
+
     $sql = "INSERT INTO " . APP_SCHEMA . ".policies
         (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
-         product_type, policy_year, previous_policy_id, object_insured, sum_insured, coverage_notes,
+         product_type, policy_year, previous_policy_id, object_insured, sum_insured, coverage_notes, construction_class,
          coverage_start, coverage_end,
          premium_amount, materai_amount,
          renewal_status, payment_status,
@@ -252,7 +256,7 @@ function createPolicy($conn, $input, $username, $company_id){
          is_coassurance, notes, created_by, created_at)
         VALUES
         ('$policy_id', '$company_id', '$insurer_id', '$customer_id', $issuing_agent_id, '$policy_number', $agent_code_used,
-         '$product_type', $policy_year, $previous_policy_id, $object_insured, $sum_insured, $coverage_notes,
+         '$product_type', $policy_year, $previous_policy_id, $object_insured, $sum_insured, $coverage_notes, $construction_class,
          '$coverage_start', '$coverage_end',
          $premium_amount, $materai_amount,
          'pending', 'unpaid',
@@ -306,7 +310,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     $check = mysqli_query($conn,
         "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount,
-                object_insured, sum_insured, coverage_notes, coverage_start, coverage_end, notes
+                object_insured, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
@@ -326,6 +330,18 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     if (isset($input['coverage_notes'])) {
         $val = trim(mysqli_real_escape_string($conn, $input['coverage_notes']));
         $updates[] = "coverage_notes = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['construction_class'])) {
+        $valid_classes = ['I', 'II', 'III'];
+        $cc = strtoupper(trim($input['construction_class']));
+        if ($input['construction_class'] === null || $input['construction_class'] === '') {
+            $updates[] = "construction_class = NULL";
+        } elseif (in_array($cc, $valid_classes, true)) {
+            $updates[] = "construction_class = '$cc'";
+        } else {
+            jsonResponse(400, 'construction_class must be I, II, or III');
+            return;
+        }
     }
     if (isset($input['coverage_start'])) {
         $val = trim(mysqli_real_escape_string($conn, $input['coverage_start']));
@@ -398,6 +414,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
             'object_insured'      => 'objek pertanggungan',
             'sum_insured'         => 'uang pertanggungan',
             'coverage_notes'      => 'catatan pertanggungan',
+            'construction_class'  => 'kelas konstruksi',
             'coverage_start'      => 'mulai pertanggungan',
             'coverage_end'        => 'akhir pertanggungan',
             'premium_amount'      => 'premi',

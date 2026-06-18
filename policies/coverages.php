@@ -7,6 +7,7 @@ require_once __DIR__ . '/../helpers/policy_log.php';
 const COVERAGE_TYPES = ['bangunan', 'stok', 'invenisi', 'mesin', 'dll'];
 
 // Recomputes sum_insured, premium_amount, and commission_amount on the parent policy from its coverages.
+// Only rows with count_in_tsi=1 contribute to sum_insured (so duplicate clauses on the same object don't inflate TSI).
 // Also syncs the pending commission record so expected_amount stays accurate.
 function syncPolicyTotals($conn, $policy_id) {
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
@@ -14,7 +15,7 @@ function syncPolicyTotals($conn, $policy_id) {
     mysqli_query($conn,
         "UPDATE " . APP_SCHEMA . ".policies p
          SET
-           p.sum_insured       = COALESCE((SELECT SUM(c.sum_insured)    FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0),
+           p.sum_insured       = COALESCE((SELECT SUM(c.sum_insured)    FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id' AND c.count_in_tsi = 1), 0),
            p.premium_amount    = COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0),
            p.commission_amount = ROUND(
              COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0)
@@ -48,16 +49,20 @@ function getCoverages($conn, $policy_id, $company_id) {
     }
 
     $result = mysqli_query($conn,
-        "SELECT coverage_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, created_at, updated_at
+        "SELECT coverage_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, created_at, updated_at
          FROM " . APP_SCHEMA . ".policy_coverages
          WHERE policy_id = '$policy_id'
          ORDER BY FIELD(coverage_type, 'bangunan','stok','invenisi','mesin','dll'), coverage_label ASC"
     );
 
     $rows = $result ? mysqli_fetch_all($result, MYSQLI_ASSOC) : [];
+    foreach ($rows as &$row) {
+        $row['count_in_tsi'] = (bool)(int)$row['count_in_tsi'];
+    }
+    unset($row);
 
     $totals = mysqli_query($conn,
-        "SELECT SUM(sum_insured) AS total_sum_insured, SUM(premium_amount) AS total_premium
+        "SELECT SUM(CASE WHEN count_in_tsi = 1 THEN sum_insured ELSE 0 END) AS total_sum_insured, SUM(premium_amount) AS total_premium
          FROM " . APP_SCHEMA . ".policy_coverages WHERE policy_id = '$policy_id'"
     );
     $t = $totals ? mysqli_fetch_assoc($totals) : [];
@@ -101,6 +106,9 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
 
     $sum_insured   = (int)$input['sum_insured'];
     $rate_permille = $input['rate_permille'];
+    // count_in_tsi=false lets agents add extra clauses (RSMD, OTHERS) on the same object
+    // without inflating the policy TSI — premium still calculated on the full sum_insured.
+    $count_in_tsi  = isset($input['count_in_tsi']) ? ($input['count_in_tsi'] ? 1 : 0) : 1;
 
     if ($sum_insured < 0) {
         jsonResponse(400, 'sum_insured must be a non-negative integer');
@@ -117,8 +125,8 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
     $now            = date('Y-m-d H:i:s');
 
     $sql = "INSERT INTO " . APP_SCHEMA . ".policy_coverages
-                (coverage_id, policy_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, created_by, created_at)
-            VALUES ('$coverage_id', '$policy_id', '$coverage_type', $coverage_label, $sum_insured, $rate_permille, $premium_amount, '$username', '$now')";
+                (coverage_id, policy_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, created_by, created_at)
+            VALUES ('$coverage_id', '$policy_id', '$coverage_type', $coverage_label, $sum_insured, $rate_permille, $premium_amount, $count_in_tsi, '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
         syncPolicyTotals($conn, $policy_id);
@@ -128,7 +136,8 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
             "Endorsemen: item pertanggungan ditambahkan — {$coverage_type}{$label_text}", $username,
             null, null, 'policy_coverages', $coverage_id,
             ['coverage_type' => $coverage_type, 'sum_insured' => $sum_insured,
-             'rate_permille' => (float)$rate_permille, 'premium_amount' => $premium_amount]);
+             'rate_permille' => (float)$rate_permille, 'premium_amount' => $premium_amount,
+             'count_in_tsi' => (bool)$count_in_tsi]);
         jsonResponse(201, 'Coverage item added', ['coverage_id' => $coverage_id, 'premium_amount' => $premium_amount]);
     } else {
         jsonResponse(500, 'Failed to add coverage', ['error' => mysqli_error($conn)]);
@@ -142,7 +151,7 @@ function updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $com
     $company_id  = mysqli_real_escape_string($conn, $company_id);
 
     $check = mysqli_query($conn,
-        "SELECT c.sum_insured, c.rate_permille
+        "SELECT c.sum_insured, c.rate_permille, c.count_in_tsi
          FROM " . APP_SCHEMA . ".policy_coverages c
          JOIN " . APP_SCHEMA . ".policies p ON p.policy_id = c.policy_id
          WHERE c.coverage_id = '$coverage_id' AND c.policy_id = '$policy_id' AND p.company_id = '$company_id'
@@ -156,6 +165,9 @@ function updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $com
     $current = mysqli_fetch_assoc($check);
     $updates = [];
 
+    if (isset($input['count_in_tsi'])) {
+        $updates[] = "count_in_tsi = " . ($input['count_in_tsi'] ? 1 : 0);
+    }
     if (isset($input['coverage_type'])) {
         $ct = strtolower(trim(mysqli_real_escape_string($conn, $input['coverage_type'])));
         if (!in_array($ct, COVERAGE_TYPES, true)) {
