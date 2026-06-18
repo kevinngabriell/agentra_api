@@ -299,7 +299,36 @@ function getDetailPolicy($conn, $policy_id, $company_id){
     jsonResponse(200, 'Policy found', mysqli_fetch_assoc($result));
 }
 
-// --- UPDATE (PO-004) ---
+// --- DELETE (PO-004) ---
+function deletePolicy($conn, $policy_id, $company_id) {
+    if (!$policy_id) {
+        jsonResponse(400, 'policy_id is required');
+        return;
+    }
+
+    $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
+    $check = mysqli_query($conn,
+        "SELECT policy_id FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Policy not found');
+        return;
+    }
+
+    mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".policy_logs     WHERE policy_id = '$policy_id'");
+    mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".follow_up_logs  WHERE policy_id = '$policy_id'");
+    mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".policy_coverages WHERE policy_id = '$policy_id'");
+    mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".policy_coassurance WHERE policy_id = '$policy_id'");
+    mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".commissions      WHERE policy_id = '$policy_id'");
+
+    if (mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
+        jsonResponse(200, 'Policy deleted successfully');
+    } else {
+        jsonResponse(500, 'Failed to delete policy', ['error' => mysqli_error($conn)]);
+    }
+}
+
+// --- UPDATE (PO-005) ---
 function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     if (!$policy_id) {
         jsonResponse(400, 'policy_id is required');
@@ -450,7 +479,151 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     }
 }
 
-// --- UPDATE RENEWAL STATUS (PO-005) ---
+// --- DIRECT UPDATE WITHOUT ENDORSEMENT (PO-006) ---
+function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
+    if (!$policy_id) {
+        jsonResponse(400, 'policy_id is required');
+        return;
+    }
+
+    $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
+    $check = mysqli_query($conn,
+        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount,
+                object_insured, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
+         FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Policy not found');
+        return;
+    }
+    $current = mysqli_fetch_assoc($check);
+
+    $updates = [];
+
+    if (isset($input['object_insured'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
+        $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['sum_insured'])) {
+        $updates[] = "sum_insured = " . (int)$input['sum_insured'];
+    }
+    if (isset($input['coverage_notes'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['coverage_notes']));
+        $updates[] = "coverage_notes = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['construction_class'])) {
+        $valid_classes = ['I', 'II', 'III'];
+        $cc = strtoupper(trim($input['construction_class']));
+        if ($input['construction_class'] === null || $input['construction_class'] === '') {
+            $updates[] = "construction_class = NULL";
+        } elseif (in_array($cc, $valid_classes, true)) {
+            $updates[] = "construction_class = '$cc'";
+        } else {
+            jsonResponse(400, 'construction_class must be I, II, or III');
+            return;
+        }
+    }
+    if (isset($input['coverage_start'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['coverage_start']));
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $val)) {
+            jsonResponse(400, 'coverage_start must be YYYY-MM-DD format');
+            return;
+        }
+        $updates[] = "coverage_start = '$val'";
+    }
+    if (isset($input['coverage_end'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['coverage_end']));
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $val)) {
+            jsonResponse(400, 'coverage_end must be YYYY-MM-DD format');
+            return;
+        }
+        $updates[] = "coverage_end = '$val'";
+    }
+    if (isset($input['notes'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['notes']));
+        $updates[] = "notes = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+
+    $new_premium  = isset($input['premium_amount'])      ? (int)$input['premium_amount']                 : null;
+    $new_rate     = isset($input['commission_rate'])     ? round((float)$input['commission_rate'], 2)     : null;
+    $new_materai  = isset($input['materai_amount'])      ? max(0, (int)$input['materai_amount'])           : null;
+    $new_tax_rate = isset($input['commission_tax_rate']) ? round((float)$input['commission_tax_rate'], 4) : null;
+
+    if ($new_premium  !== null) { $updates[] = "premium_amount = $new_premium"; }
+    if ($new_rate     !== null) { $updates[] = "commission_rate = $new_rate"; }
+    if ($new_materai  !== null) { $updates[] = "materai_amount = $new_materai"; }
+    if ($new_tax_rate !== null) { $updates[] = "commission_tax_rate = $new_tax_rate"; }
+
+    if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
+        $premium  = $new_premium  ?? (int)$current['premium_amount'];
+        $rate     = $new_rate     ?? (float)$current['commission_rate'];
+        $materai  = $new_materai  ?? (int)$current['materai_amount'];
+        $tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+
+        $comm_amount  = (int)round($premium * $rate / 100);
+        $tax_amount   = (int)round($comm_amount * $tax_rate);
+        $net_comm     = $comm_amount - $tax_amount;
+        $cust_premium = $premium + $materai - $comm_amount;
+
+        $updates[] = "commission_amount = $comm_amount";
+        $updates[] = "commission_tax_amount = $tax_amount";
+        $updates[] = "net_commission_amount = $net_comm";
+        $updates[] = "customer_premium_amount = $cust_premium";
+    }
+
+    if (empty($updates)) {
+        jsonResponse(400, 'No fields provided for update');
+        return;
+    }
+
+    $now = date('Y-m-d H:i:s');
+    $updates[] = "updated_by = '$username'";
+    $updates[] = "updated_at = '$now'";
+
+    if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET " . implode(', ', $updates) . " WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
+        $label_map = [
+            'object_insured'      => 'objek pertanggungan',
+            'sum_insured'         => 'uang pertanggungan',
+            'coverage_notes'      => 'catatan pertanggungan',
+            'construction_class'  => 'kelas konstruksi',
+            'coverage_start'      => 'mulai pertanggungan',
+            'coverage_end'        => 'akhir pertanggungan',
+            'premium_amount'      => 'premi',
+            'materai_amount'      => 'materai',
+            'commission_rate'     => 'rate komisi',
+            'commission_tax_rate' => 'rate pajak komisi',
+            'notes'               => 'catatan',
+        ];
+        $changed_labels = [];
+        $before = [];
+        $after  = [];
+        foreach ($label_map as $field => $label) {
+            if (isset($input[$field])) {
+                $changed_labels[] = $label;
+                $before[$field]   = $current[$field] ?? null;
+                $after[$field]    = $input[$field];
+            }
+        }
+        $desc = 'Polis diperbarui (koreksi)' . (!empty($changed_labels) ? ': ' . implode(', ', $changed_labels) : '');
+
+        insertPolicyLog($conn, $policy_id, $company_id, 'policy_updated', $desc, $username,
+            null, null, null, null, ['before' => $before, 'after' => $after]);
+
+        if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
+            $final_premium  = $new_premium  ?? (int)$current['premium_amount'];
+            $final_rate     = $new_rate     ?? (float)$current['commission_rate'];
+            $final_tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+            $final_amount   = (int)round($final_premium * $final_rate / 100);
+            syncCommission($conn, $policy_id, $final_premium, $final_rate, $final_amount, $final_tax_rate);
+        }
+
+        jsonResponse(200, 'Policy updated successfully');
+    } else {
+        jsonResponse(500, 'Failed to update policy', ['error' => mysqli_error($conn)]);
+    }
+}
+
+// --- UPDATE RENEWAL STATUS (PO-007) ---
 function updateRenewalStatus($conn, $policy_id, $company_id, $input, $username){
     if (!$policy_id) {
         jsonResponse(400, 'policy_id is required');
@@ -482,7 +655,7 @@ function updateRenewalStatus($conn, $policy_id, $company_id, $input, $username){
     }
 }
 
-// --- ADD FOLLOW-UP (PO-006) ---
+// --- ADD FOLLOW-UP (PO-008) ---
 function addFollowUp($conn, $policy_id, $company_id, $input, $username){
     if (!$policy_id) {
         jsonResponse(400, 'policy_id is required');
@@ -529,7 +702,7 @@ function addFollowUp($conn, $policy_id, $company_id, $input, $username){
     }
 }
 
-// --- UPDATE PAYMENT STATUS (PO-007, Main Agent only) ---
+// --- UPDATE PAYMENT STATUS (PO-009, Main Agent only) ---
 function updatePaymentStatus($conn, $policy_id, $company_id, $input, $username){
     if (!$policy_id) {
         jsonResponse(400, 'policy_id is required');
@@ -561,7 +734,7 @@ function updatePaymentStatus($conn, $policy_id, $company_id, $input, $username){
     }
 }
 
-// --- PAYMENT SUMMARY (PO-008, Main Agent only) ---
+// --- PAYMENT SUMMARY (PO-010, Main Agent only) ---
 function getPaymentSummary($conn, $company_id, $params){
     $insurer_id     = isset($params['insurer_id']) ? mysqli_real_escape_string($conn, $params['insurer_id']) : '';
     $month          = isset($params['month'])      ? mysqli_real_escape_string($conn, $params['month'])      : '';
@@ -629,7 +802,7 @@ function getPaymentSummary($conn, $company_id, $params){
     ]);
 }
 
-// --- GET COMMISSION (PO-009) ---
+// --- GET COMMISSION (PO-011) ---
 function getCommission($conn, $policy_id, $company_id) {
     if (!$policy_id) {
         jsonResponse(400, 'policy_id is required');
@@ -664,7 +837,7 @@ function getCommission($conn, $policy_id, $company_id) {
     jsonResponse(200, 'Commission found', mysqli_fetch_assoc($result));
 }
 
-// --- GET POLICY LOGS (PO-010) ---
+// --- GET POLICY LOGS (PO-012) ---
 function getPolicyLogs($conn, $policy_id, $company_id, $params) {
     if (!$policy_id) {
         jsonResponse(400, 'policy_id is required');
@@ -782,6 +955,13 @@ try {
             case 'PUT':
                 $input = json_decode(file_get_contents('php://input'), true) ?? [];
                 updatePolicy($conn, $policy_id, $input, $username, $company_id);
+                break;
+            case 'PATCH':
+                $input = json_decode(file_get_contents('php://input'), true) ?? [];
+                directUpdatePolicy($conn, $policy_id, $input, $username, $company_id);
+                break;
+            case 'DELETE':
+                deletePolicy($conn, $policy_id, $company_id);
                 break;
             default:
                 jsonResponse(405, 'Method Not Allowed');
