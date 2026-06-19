@@ -86,6 +86,7 @@ function getAllPolicies($conn, $company_id, $params){
                 p.renewal_status, p.payment_status,
                 p.coverage_start, p.coverage_end,
                 p.sum_insured, p.premium_amount, p.materai_amount,
+                p.biaya_polis, p.diskon,
                 p.commission_rate, p.commission_amount,
                 p.commission_tax_rate, p.commission_tax_amount,
                 p.net_commission_amount, p.customer_premium_amount,
@@ -191,15 +192,21 @@ function createPolicy($conn, $input, $username, $company_id){
     // [NEW v1.1] Materai: stamp duty in IDR, per-policy, optional.
     $materai_amount = isset($input['materai_amount']) ? max(0, (int)$input['materai_amount']) : 0;
 
+    // Biaya polis: admin/policy fee in IDR, optional.
+    $biaya_polis = isset($input['biaya_polis']) ? max(0, (int)$input['biaya_polis']) : 0;
+
+    // Diskon: discount in IDR, optional.
+    $diskon = isset($input['diskon']) ? max(0, (int)$input['diskon']) : 0;
+
     // Derived commission breakdown:
-    //   commission_amount      = premium × rate / 100            (gross, before tax)
-    //   commission_tax_amount  = commission_amount × tax_rate    (PPh withheld)
-    //   net_commission_amount  = commission_amount − tax_amount  (agent nets this)
-    //   customer_premium_amount = premium + materai − commission (billed to customer)
+    //   commission_amount       = premium × rate / 100                          (gross, before tax)
+    //   commission_tax_amount   = commission_amount × tax_rate                  (PPh withheld)
+    //   net_commission_amount   = commission_amount − tax_amount                (agent nets this)
+    //   customer_premium_amount = premium + materai + biaya_polis − commission − diskon (billed to customer)
     $commission_amount       = (int)round($premium_amount * $commission_rate / 100);
     $commission_tax_amount   = (int)round($commission_amount * $commission_tax_rate);
     $net_commission_amount   = $commission_amount - $commission_tax_amount;
-    $customer_premium_amount = $premium_amount + $materai_amount - $commission_amount;
+    $customer_premium_amount = $premium_amount + $materai_amount + $biaya_polis - $commission_amount - $diskon;
 
     // [NEW v1.1] Co-assurance flag: FE sets this to true when adding co-insurers after creation.
     $is_coassurance = !empty($input['is_coassurance']) ? 1 : 0;
@@ -249,7 +256,7 @@ function createPolicy($conn, $input, $username, $company_id){
         (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
          product_type, policy_year, previous_policy_id, object_insured, sum_insured, coverage_notes, construction_class,
          coverage_start, coverage_end,
-         premium_amount, materai_amount,
+         premium_amount, materai_amount, biaya_polis, diskon,
          renewal_status, payment_status,
          commission_rate, commission_amount,
          commission_tax_rate, commission_tax_amount, net_commission_amount, customer_premium_amount,
@@ -258,7 +265,7 @@ function createPolicy($conn, $input, $username, $company_id){
         ('$policy_id', '$company_id', '$insurer_id', '$customer_id', $issuing_agent_id, '$policy_number', $agent_code_used,
          '$product_type', $policy_year, $previous_policy_id, $object_insured, $sum_insured, $coverage_notes, $construction_class,
          '$coverage_start', '$coverage_end',
-         $premium_amount, $materai_amount,
+         $premium_amount, $materai_amount, $biaya_polis, $diskon,
          'pending', 'unpaid',
          $commission_rate, $commission_amount,
          $commission_tax_rate, $commission_tax_amount, $net_commission_amount, $customer_premium_amount,
@@ -338,7 +345,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
     $check = mysqli_query($conn,
-        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount,
+        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
                 object_insured, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
@@ -393,27 +400,32 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         $updates[] = "notes = " . ($val !== '' ? "'$val'" : 'NULL');
     }
 
-    $new_premium  = isset($input['premium_amount'])      ? (int)$input['premium_amount']                      : null;
-    $new_rate     = isset($input['commission_rate'])     ? round((float)$input['commission_rate'], 2)           : null;
-    // [NEW v1.1] materai and tax rate are updatable; trigger a full commission breakdown recalc.
-    $new_materai  = isset($input['materai_amount'])      ? max(0, (int)$input['materai_amount'])                : null;
-    $new_tax_rate = isset($input['commission_tax_rate']) ? round((float)$input['commission_tax_rate'], 4)       : null;
+    $new_premium    = isset($input['premium_amount'])      ? (int)$input['premium_amount']                      : null;
+    $new_rate       = isset($input['commission_rate'])     ? round((float)$input['commission_rate'], 2)           : null;
+    $new_materai    = isset($input['materai_amount'])      ? max(0, (int)$input['materai_amount'])                : null;
+    $new_tax_rate   = isset($input['commission_tax_rate']) ? round((float)$input['commission_tax_rate'], 4)       : null;
+    $new_biaya      = isset($input['biaya_polis'])         ? max(0, (int)$input['biaya_polis'])                   : null;
+    $new_diskon     = isset($input['diskon'])              ? max(0, (int)$input['diskon'])                        : null;
 
-    if ($new_premium !== null)  { $updates[] = "premium_amount = $new_premium"; }
-    if ($new_rate    !== null)  { $updates[] = "commission_rate = $new_rate"; }
-    if ($new_materai !== null)  { $updates[] = "materai_amount = $new_materai"; }
+    if ($new_premium  !== null) { $updates[] = "premium_amount = $new_premium"; }
+    if ($new_rate     !== null) { $updates[] = "commission_rate = $new_rate"; }
+    if ($new_materai  !== null) { $updates[] = "materai_amount = $new_materai"; }
     if ($new_tax_rate !== null) { $updates[] = "commission_tax_rate = $new_tax_rate"; }
+    if ($new_biaya    !== null) { $updates[] = "biaya_polis = $new_biaya"; }
+    if ($new_diskon   !== null) { $updates[] = "diskon = $new_diskon"; }
 
-    if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
-        $premium  = $new_premium  ?? (int)$current['premium_amount'];
-        $rate     = $new_rate     ?? (float)$current['commission_rate'];
-        $materai  = $new_materai  ?? (int)$current['materai_amount'];
-        $tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+    if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null || $new_biaya !== null || $new_diskon !== null) {
+        $premium     = $new_premium  ?? (int)$current['premium_amount'];
+        $rate        = $new_rate     ?? (float)$current['commission_rate'];
+        $materai     = $new_materai  ?? (int)$current['materai_amount'];
+        $tax_rate    = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+        $biaya_polis = $new_biaya    ?? (int)$current['biaya_polis'];
+        $diskon      = $new_diskon   ?? (int)$current['diskon'];
 
         $comm_amount  = (int)round($premium * $rate / 100);
         $tax_amount   = (int)round($comm_amount * $tax_rate);
         $net_comm     = $comm_amount - $tax_amount;
-        $cust_premium = $premium + $materai - $comm_amount;
+        $cust_premium = $premium + $materai + $biaya_polis - $comm_amount - $diskon;
 
         $updates[] = "commission_amount = $comm_amount";
         $updates[] = "commission_tax_amount = $tax_amount";
@@ -432,7 +444,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET " . implode(', ', $updates) . " WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
         // Determine event type: endorsement when financial or date fields change
-        $financial_keys = ['sum_insured', 'premium_amount', 'commission_rate', 'commission_tax_rate', 'materai_amount', 'coverage_start', 'coverage_end'];
+        $financial_keys = ['sum_insured', 'premium_amount', 'commission_rate', 'commission_tax_rate', 'materai_amount', 'biaya_polis', 'diskon', 'coverage_start', 'coverage_end'];
         $is_endorsement = (bool)array_intersect($financial_keys, array_keys($input));
         $event_type     = $is_endorsement ? 'endorsement' : 'policy_updated';
 
@@ -448,6 +460,8 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
             'coverage_end'        => 'akhir pertanggungan',
             'premium_amount'      => 'premi',
             'materai_amount'      => 'materai',
+            'biaya_polis'         => 'biaya polis',
+            'diskon'              => 'diskon',
             'commission_rate'     => 'rate komisi',
             'commission_tax_rate' => 'rate pajak komisi',
             'notes'               => 'catatan',
@@ -489,7 +503,7 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
     $check = mysqli_query($conn,
-        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount,
+        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
                 object_insured, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
@@ -548,22 +562,28 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
     $new_rate     = isset($input['commission_rate'])     ? round((float)$input['commission_rate'], 2)     : null;
     $new_materai  = isset($input['materai_amount'])      ? max(0, (int)$input['materai_amount'])           : null;
     $new_tax_rate = isset($input['commission_tax_rate']) ? round((float)$input['commission_tax_rate'], 4) : null;
+    $new_biaya    = isset($input['biaya_polis'])         ? max(0, (int)$input['biaya_polis'])              : null;
+    $new_diskon   = isset($input['diskon'])              ? max(0, (int)$input['diskon'])                   : null;
 
     if ($new_premium  !== null) { $updates[] = "premium_amount = $new_premium"; }
     if ($new_rate     !== null) { $updates[] = "commission_rate = $new_rate"; }
     if ($new_materai  !== null) { $updates[] = "materai_amount = $new_materai"; }
     if ($new_tax_rate !== null) { $updates[] = "commission_tax_rate = $new_tax_rate"; }
+    if ($new_biaya    !== null) { $updates[] = "biaya_polis = $new_biaya"; }
+    if ($new_diskon   !== null) { $updates[] = "diskon = $new_diskon"; }
 
-    if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
-        $premium  = $new_premium  ?? (int)$current['premium_amount'];
-        $rate     = $new_rate     ?? (float)$current['commission_rate'];
-        $materai  = $new_materai  ?? (int)$current['materai_amount'];
-        $tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+    if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null || $new_biaya !== null || $new_diskon !== null) {
+        $premium     = $new_premium  ?? (int)$current['premium_amount'];
+        $rate        = $new_rate     ?? (float)$current['commission_rate'];
+        $materai     = $new_materai  ?? (int)$current['materai_amount'];
+        $tax_rate    = $new_tax_rate ?? (float)$current['commission_tax_rate'];
+        $biaya_polis = $new_biaya    ?? (int)$current['biaya_polis'];
+        $diskon      = $new_diskon   ?? (int)$current['diskon'];
 
         $comm_amount  = (int)round($premium * $rate / 100);
         $tax_amount   = (int)round($comm_amount * $tax_rate);
         $net_comm     = $comm_amount - $tax_amount;
-        $cust_premium = $premium + $materai - $comm_amount;
+        $cust_premium = $premium + $materai + $biaya_polis - $comm_amount - $diskon;
 
         $updates[] = "commission_amount = $comm_amount";
         $updates[] = "commission_tax_amount = $tax_amount";
@@ -590,6 +610,8 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
             'coverage_end'        => 'akhir pertanggungan',
             'premium_amount'      => 'premi',
             'materai_amount'      => 'materai',
+            'biaya_polis'         => 'biaya polis',
+            'diskon'              => 'diskon',
             'commission_rate'     => 'rate komisi',
             'commission_tax_rate' => 'rate pajak komisi',
             'notes'               => 'catatan',
