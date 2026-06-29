@@ -130,10 +130,10 @@ function exportPolicies($conn, $company_id, array $params): void {
             COALESCE(pp.policy_number, 'BARU') AS prev_policy_number
         FROM " . APP_SCHEMA . ".policies p
         LEFT JOIN " . APP_SCHEMA . ".customers c  ON c.customer_id = p.customer_id
-        LEFT JOIN " . CORE_SCHEMA . ".app_user u  ON u.user_id     = p.issuing_agent_id
+        LEFT JOIN " . CORE_SCHEMA . ".app_user u  ON u.user_id COLLATE utf8mb4_unicode_ci = p.issuing_agent_id
         LEFT JOIN " . APP_SCHEMA . ".policies pp  ON pp.policy_id  = p.previous_policy_id
         WHERE $where
-        ORDER BY COALESCE(u.first_name, ''), p.issuing_agent_id, p.coverage_start ASC
+        ORDER BY COALESCE(u.first_name COLLATE utf8mb4_unicode_ci, ''), p.issuing_agent_id, p.coverage_start ASC
     ";
 
     $result = mysqli_query($conn, $sql);
