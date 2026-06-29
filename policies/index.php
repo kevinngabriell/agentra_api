@@ -4,6 +4,7 @@ require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
 require_once __DIR__ . '/../helpers/commission.php';
+require_once __DIR__ . '/export.php';
 
 // Looks up commission rate and tax rate from master_products.
 // Matches first by product_code (= product_type), then by policy number prefix via policy_prefixes.
@@ -917,9 +918,9 @@ if (!$company_id) {
     exit;
 }
 
-// $action     = $parts[3] — policy_id, 'payment-summary', or ''
-// $sub_action = $parts[4] — 'renewal-status', 'follow-ups', 'payment-status', 'coverages', or ''
-$policy_id  = (!empty($action) && $action !== 'payment-summary') ? $action : null;
+// $action     = $parts[3] — policy_id, 'payment-summary', 'export', or ''
+// $sub_action = $parts[4] — 'renewal-status', 'follow-ups', 'payment-status', 'coverages', etc.
+$policy_id  = (!empty($action) && !in_array($action, ['payment-summary', 'export'], true)) ? $action : null;
 $sub_action = $parts[4] ?? '';
 
 try {
@@ -929,6 +930,11 @@ try {
     if ($action === 'payment-summary') {
         if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
         getPaymentSummary($conn, $company_id, $_GET);
+
+    // GET /api/v1/policies/export
+    } elseif ($action === 'export') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        exportPolicies($conn, $company_id, $_GET);
 
     // /api/v1/policies/{policy_id}/{sub-action}
     } elseif ($policy_id && $sub_action !== '') {
