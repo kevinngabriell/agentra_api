@@ -678,6 +678,270 @@ function updateRenewalStatus($conn, $policy_id, $company_id, $input, $username){
     }
 }
 
+// --- CONFIRM RENEWAL (PO-009) ---
+// Creates the next-term policy for a renewal, linking it back via previous_policy_id,
+// then marks the expiring policy as 'renewed'. Any field not supplied in $input is
+// carried over from the policy being renewed — only the fields that actually differ
+// need to be sent: policy_number, coverage_start/coverage_end (periode), coverages
+// (rate + coverage item breakdown), and customer_id (nama tertanggung).
+function confirmRenewal($conn, $policy_id, $company_id, $input, $username) {
+    if (!$policy_id) {
+        jsonResponse(400, 'policy_id is required');
+        return;
+    }
+
+    $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
+    $old = mysqli_query($conn, "SELECT * FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
+    if (!$old || mysqli_num_rows($old) === 0) {
+        jsonResponse(404, 'Policy not found');
+        return;
+    }
+    $prev = mysqli_fetch_assoc($old);
+
+    if ($prev['renewal_status'] === 'renewed') {
+        jsonResponse(409, 'Policy has already been renewed');
+        return;
+    }
+
+    $already = mysqli_query($conn, "SELECT policy_id FROM " . APP_SCHEMA . ".policies WHERE previous_policy_id = '$policy_id' LIMIT 1");
+    if ($already && mysqli_num_rows($already) > 0) {
+        jsonResponse(409, 'A renewal policy already exists for this policy');
+        return;
+    }
+
+    if (!isset($input['policy_number']) || trim($input['policy_number']) === '') {
+        jsonResponse(400, 'policy_number is required for the renewed policy');
+        return;
+    }
+    $policy_number = trim(mysqli_real_escape_string($conn, $input['policy_number']));
+
+    $dup = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE company_id = '$company_id' AND policy_number = '$policy_number' LIMIT 1");
+    if (mysqli_num_rows($dup) > 0) {
+        jsonResponse(409, 'Policy number already exists for this company');
+        return;
+    }
+
+    // Periode: auto-extend 1 year from the previous term unless explicitly overridden
+    if (isset($input['coverage_start']) || isset($input['coverage_end'])) {
+        $coverage_start = isset($input['coverage_start']) ? trim(mysqli_real_escape_string($conn, $input['coverage_start'])) : '';
+        $coverage_end   = isset($input['coverage_end'])   ? trim(mysqli_real_escape_string($conn, $input['coverage_end']))   : '';
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $coverage_start)) {
+            jsonResponse(400, 'coverage_start must be YYYY-MM-DD format');
+            return;
+        }
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $coverage_end)) {
+            jsonResponse(400, 'coverage_end must be YYYY-MM-DD format');
+            return;
+        }
+    } else {
+        $coverage_start = date('Y-m-d', strtotime($prev['coverage_start'] . ' +1 year'));
+        $coverage_end   = date('Y-m-d', strtotime($prev['coverage_end']   . ' +1 year'));
+    }
+    if ($coverage_end <= $coverage_start) {
+        jsonResponse(400, 'coverage_end must be after coverage_start');
+        return;
+    }
+
+    // Nama tertanggung: defaults to the same customer, override only when it changes
+    $customer_id = isset($input['customer_id']) && $input['customer_id'] !== ''
+        ? mysqli_real_escape_string($conn, $input['customer_id'])
+        : $prev['customer_id'];
+
+    if ($customer_id !== $prev['customer_id']) {
+        $cust_check = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".customers WHERE customer_id = '$customer_id' AND company_id = '$company_id' LIMIT 1");
+        if (mysqli_num_rows($cust_check) === 0) {
+            jsonResponse(404, 'Customer not found');
+            return;
+        }
+    }
+
+    // Previous coverage breakdown — used both as the default and as the "before" side of the diff
+    $prev_cov_res  = mysqli_query($conn,
+        "SELECT coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi
+         FROM " . APP_SCHEMA . ".policy_coverages WHERE policy_id = '$policy_id'
+         ORDER BY FIELD(coverage_type, 'bangunan','stok','invenisi','mesin','dll'), coverage_label ASC");
+    $prev_coverages = $prev_cov_res ? mysqli_fetch_all($prev_cov_res, MYSQLI_ASSOC) : [];
+
+    // Coverage item(s) + rate: override with `coverages`, or carry over the previous breakdown
+    if (isset($input['coverages']) && is_array($input['coverages'])) {
+        $coverage_items = [];
+        foreach ($input['coverages'] as $c) {
+            foreach (['coverage_type', 'sum_insured', 'rate_permille'] as $f) {
+                if (!isset($c[$f]) || $c[$f] === '') {
+                    jsonResponse(400, "coverages[].$f is required");
+                    return;
+                }
+            }
+            $type = strtolower(trim(mysqli_real_escape_string($conn, $c['coverage_type'])));
+            $valid_coverage_types = ['bangunan', 'stok', 'invenisi', 'mesin', 'dll'];
+            if (!in_array($type, $valid_coverage_types, true)) {
+                jsonResponse(400, 'coverage_type must be one of: ' . implode(', ', $valid_coverage_types));
+                return;
+            }
+            $sum_insured   = (int)$c['sum_insured'];
+            $rate_permille = (float)$c['rate_permille'];
+            if ($sum_insured < 0 || $rate_permille < 0) {
+                jsonResponse(400, 'coverages[].sum_insured and rate_permille must be non-negative');
+                return;
+            }
+            $coverage_items[] = [
+                'coverage_type'  => $type,
+                'coverage_label' => isset($c['coverage_label']) && trim($c['coverage_label']) !== ''
+                    ? trim($c['coverage_label']) : null,
+                'sum_insured'    => $sum_insured,
+                'rate_permille'  => number_format($rate_permille, 4, '.', ''),
+                'premium_amount' => (int)round($sum_insured * $rate_permille / 1000),
+                'count_in_tsi'   => isset($c['count_in_tsi']) ? ($c['count_in_tsi'] ? 1 : 0) : 1,
+            ];
+        }
+    } else {
+        $coverage_items = $prev_coverages;
+    }
+
+    // Sum insured / premium derived from the coverage breakdown (falls back to the previous
+    // policy's own totals if it had no coverage rows at all).
+    if (!empty($coverage_items)) {
+        $sum_insured    = array_sum(array_map(fn($c) => $c['count_in_tsi'] ? (int)$c['sum_insured'] : 0, $coverage_items));
+        $premium_amount = array_sum(array_map(fn($c) => (int)$c['premium_amount'], $coverage_items));
+    } else {
+        $sum_insured    = (int)$prev['sum_insured'];
+        $premium_amount = (int)$prev['premium_amount'];
+    }
+
+    $commission_rate     = isset($input['commission_rate'])     ? round((float)$input['commission_rate'], 2)     : (float)$prev['commission_rate'];
+    $commission_tax_rate = isset($input['commission_tax_rate']) ? round((float)$input['commission_tax_rate'], 4) : (float)$prev['commission_tax_rate'];
+    $materai_amount      = isset($input['materai_amount'])      ? max(0, (int)$input['materai_amount'])          : (int)$prev['materai_amount'];
+    $biaya_polis         = isset($input['biaya_polis'])         ? max(0, (int)$input['biaya_polis'])             : (int)$prev['biaya_polis'];
+    $diskon              = isset($input['diskon'])              ? max(0, (int)$input['diskon'])                 : (int)$prev['diskon'];
+
+    $commission_amount       = (int)round($premium_amount * $commission_rate / 100);
+    $commission_tax_amount   = (int)round($commission_amount * $commission_tax_rate);
+    $net_commission_amount   = $commission_amount - $commission_tax_amount;
+    $customer_premium_amount = $premium_amount + $materai_amount + $biaya_polis - $commission_amount - $diskon;
+
+    $object_insured = isset($input['object_insured'])
+        ? (trim($input['object_insured']) !== '' ? "'" . mysqli_real_escape_string($conn, trim($input['object_insured'])) . "'" : 'NULL')
+        : ($prev['object_insured'] !== null ? "'" . mysqli_real_escape_string($conn, $prev['object_insured']) . "'" : 'NULL');
+    $coverage_notes = isset($input['coverage_notes'])
+        ? (trim($input['coverage_notes']) !== '' ? "'" . mysqli_real_escape_string($conn, trim($input['coverage_notes'])) . "'" : 'NULL')
+        : ($prev['coverage_notes'] !== null ? "'" . mysqli_real_escape_string($conn, $prev['coverage_notes']) . "'" : 'NULL');
+    $notes = isset($input['notes'])
+        ? (trim($input['notes']) !== '' ? "'" . mysqli_real_escape_string($conn, trim($input['notes'])) . "'" : 'NULL')
+        : ($prev['notes'] !== null ? "'" . mysqli_real_escape_string($conn, $prev['notes']) . "'" : 'NULL');
+
+    $valid_classes = ['I', 'II', 'III'];
+    $construction_class = isset($input['construction_class']) && in_array(strtoupper(trim($input['construction_class'])), $valid_classes, true)
+        ? "'" . strtoupper(trim($input['construction_class'])) . "'"
+        : ($prev['construction_class'] !== null ? "'" . mysqli_real_escape_string($conn, $prev['construction_class']) . "'" : 'NULL');
+
+    $issuing_agent_id = isset($input['issuing_agent_id'])
+        ? ($input['issuing_agent_id'] !== '' ? "'" . mysqli_real_escape_string($conn, $input['issuing_agent_id']) . "'" : 'NULL')
+        : ($prev['issuing_agent_id'] !== null ? "'" . mysqli_real_escape_string($conn, $prev['issuing_agent_id']) . "'" : 'NULL');
+
+    $agent_code_used = $prev['agent_code_used'] !== null
+        ? "'" . mysqli_real_escape_string($conn, $prev['agent_code_used']) . "'" : 'NULL';
+    $insurer_id   = mysqli_real_escape_string($conn, $prev['insurer_id']);
+    $product_type = mysqli_real_escape_string($conn, $prev['product_type']);
+
+    $new_policy_id = 'pol_' . uniqid();
+    $now           = date('Y-m-d H:i:s');
+    $policy_year   = (int)$prev['policy_year'] + 1;
+
+    $sql = "INSERT INTO " . APP_SCHEMA . ".policies
+        (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
+         product_type, policy_year, previous_policy_id, object_insured, sum_insured, coverage_notes, construction_class,
+         coverage_start, coverage_end,
+         premium_amount, materai_amount, biaya_polis, diskon,
+         renewal_status, payment_status,
+         commission_rate, commission_amount,
+         commission_tax_rate, commission_tax_amount, net_commission_amount, customer_premium_amount,
+         is_coassurance, notes, created_by, created_at)
+        VALUES
+        ('$new_policy_id', '$company_id', '$insurer_id', '$customer_id', $issuing_agent_id, '$policy_number', $agent_code_used,
+         '$product_type', $policy_year, '$policy_id', $object_insured, $sum_insured, $coverage_notes, $construction_class,
+         '$coverage_start', '$coverage_end',
+         $premium_amount, $materai_amount, $biaya_polis, $diskon,
+         'pending', 'unpaid',
+         $commission_rate, $commission_amount,
+         $commission_tax_rate, $commission_tax_amount, $net_commission_amount, $customer_premium_amount,
+         " . (int)$prev['is_coassurance'] . ", $notes, '$username', '$now')";
+
+    if (!mysqli_query($conn, $sql)) {
+        jsonResponse(500, 'Failed to create renewed policy', ['error' => mysqli_error($conn)]);
+        return;
+    }
+
+    foreach ($coverage_items as $c) {
+        $coverage_id = 'cov_' . uniqid();
+        $label = $c['coverage_label'] !== null && $c['coverage_label'] !== ''
+            ? "'" . mysqli_real_escape_string($conn, $c['coverage_label']) . "'" : 'NULL';
+        mysqli_query($conn, "INSERT INTO " . APP_SCHEMA . ".policy_coverages
+            (coverage_id, policy_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, created_by, created_at)
+            VALUES ('$coverage_id', '$new_policy_id', '{$c['coverage_type']}', $label, {$c['sum_insured']}, {$c['rate_permille']}, {$c['premium_amount']}, {$c['count_in_tsi']}, '$username', '$now')");
+    }
+
+    insertCommission($conn, $new_policy_id, $company_id, $prev['insurer_id'], $premium_amount, $commission_rate, $commission_amount,
+        $prev['issuing_agent_id'] ?? null, $commission_tax_rate);
+
+    // Mark the expiring policy as renewed
+    mysqli_query($conn,
+        "UPDATE " . APP_SCHEMA . ".policies SET renewal_status = 'renewed', updated_by = '$username', updated_at = '$now'
+         WHERE policy_id = '$policy_id' AND company_id = '$company_id'");
+
+    // Diff of the fields that are known to change on renewal — only included when they actually differ
+    $normalizeCoverages = fn($items) => array_map(
+        fn($c) => [
+            'coverage_type'  => $c['coverage_type'],
+            'coverage_label' => $c['coverage_label'],
+            'sum_insured'    => (int)$c['sum_insured'],
+            'rate_permille'  => (float)$c['rate_permille'],
+        ],
+        $items
+    );
+
+    $changes = [];
+    if ($policy_number !== $prev['policy_number']) {
+        $changes['policy_number'] = ['from' => $prev['policy_number'], 'to' => $policy_number];
+    }
+    if ($coverage_start !== $prev['coverage_start'] || $coverage_end !== $prev['coverage_end']) {
+        $changes['periode'] = [
+            'from' => ['coverage_start' => $prev['coverage_start'], 'coverage_end' => $prev['coverage_end']],
+            'to'   => ['coverage_start' => $coverage_start, 'coverage_end' => $coverage_end],
+        ];
+    }
+    $prevCoverageSummary = $normalizeCoverages($prev_coverages);
+    $newCoverageSummary  = $normalizeCoverages($coverage_items);
+    if (json_encode($prevCoverageSummary) !== json_encode($newCoverageSummary)) {
+        $changes['coverage_item'] = ['from' => $prevCoverageSummary, 'to' => $newCoverageSummary];
+    }
+    if ($customer_id !== $prev['customer_id']) {
+        $name_res = mysqli_query($conn, "SELECT display_name, company_legal_name FROM " . APP_SCHEMA . ".customers WHERE customer_id = '$customer_id' LIMIT 1");
+        $name_row = $name_res ? mysqli_fetch_assoc($name_res) : null;
+        $changes['nama_tertanggung'] = [
+            'from' => $prev['customer_id'],
+            'to'   => $customer_id,
+            'to_name' => $name_row ? ($name_row['company_legal_name'] ?: $name_row['display_name']) : null,
+        ];
+    }
+
+    insertPolicyLog($conn, $policy_id, $company_id, 'renewal_status_changed',
+        "Renewal dikonfirmasi → polis baru $policy_number ($new_policy_id)", $username,
+        'pending', 'renewed', 'policy', $new_policy_id, ['changes' => $changes]);
+    insertPolicyLog($conn, $new_policy_id, $company_id, 'policy_created',
+        "Polis dibuat dari renewal polis {$prev['policy_number']}", $username,
+        null, null, 'policy', $policy_id);
+
+    jsonResponse(201, 'Renewal confirmed, new policy created', [
+        'policy_id'          => $new_policy_id,
+        'previous_policy_id' => $policy_id,
+        'policy_number'      => $policy_number,
+        'coverage_start'     => $coverage_start,
+        'coverage_end'       => $coverage_end,
+        'changes'            => $changes,
+    ]);
+}
+
 // --- ADD FOLLOW-UP (PO-008) ---
 function addFollowUp($conn, $policy_id, $company_id, $input, $username){
     if (!$policy_id) {
@@ -946,6 +1210,10 @@ try {
             case 'renewal-status':
                 if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
                 updateRenewalStatus($conn, $policy_id, $company_id, $input, $username);
+                break;
+            case 'confirm-renewal':
+                if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+                confirmRenewal($conn, $policy_id, $company_id, $input, $username);
                 break;
             case 'follow-ups':
                 if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }

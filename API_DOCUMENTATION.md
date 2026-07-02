@@ -821,6 +821,67 @@ Auth required.
 
 ---
 
+### 6.5.1 Confirm Renewal
+
+**POST** `/api/v1/policies/{policy_id}/confirm-renewal`
+
+Auth required. `{policy_id}` is the **expiring** policy. Creates the next-term policy
+(linked back via `previous_policy_id`) and marks the expiring policy's `renewal_status`
+as `renewed` — both in one call.
+
+Any field not sent in the body is carried over unchanged from the policy being renewed.
+Only send the fields that actually change on this renewal:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| policy_number | string | **Yes** | New policy number, unique per company |
+| coverage_start | string | No | YYYY-MM-DD. Defaults to previous `coverage_start` **+1 year** |
+| coverage_end | string | No | YYYY-MM-DD. Defaults to previous `coverage_end` **+1 year** |
+| coverages | array | No | New coverage breakdown (same shape as `POST /policies/{id}/coverages`). Defaults to a copy of the previous policy's coverage items — this carries both the coverage item and its rate |
+| customer_id | string | No | Use to change "nama tertanggung". Defaults to the same customer |
+| commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon, object_insured, coverage_notes, construction_class, issuing_agent_id, notes | — | No | Same meaning as `POST /policies`. Default to the previous policy's values |
+
+**Request Body (minimal example — only what changed):**
+```json
+{
+  "policy_number": "POL/SIMAS/2026/00001"
+}
+```
+
+**Response `201`:**
+```json
+{
+  "status_code": 201,
+  "status_message": "Renewal confirmed, new policy created",
+  "data": {
+    "policy_id": "pol_xxx",
+    "previous_policy_id": "pol_yyy",
+    "policy_number": "POL/SIMAS/2026/00001",
+    "coverage_start": "2026-06-01",
+    "coverage_end": "2027-06-01",
+    "changes": {
+      "policy_number": { "from": "POL/SIMAS/2025/00001", "to": "POL/SIMAS/2026/00001" }
+    }
+  }
+}
+```
+
+`changes` only lists the fields that actually differ from the previous policy —
+possible keys are `policy_number`, `periode`, `coverage_item`, and `nama_tertanggung`.
+
+**Error responses:**
+
+| Code | Message | Cause |
+|---|---|---|
+| `400` | `policy_number is required for the renewed policy` | Missing required field |
+| `404` | `Policy not found` | `policy_id` doesn't belong to company |
+| `404` | `Customer not found` | `customer_id` override doesn't belong to company |
+| `409` | `Policy has already been renewed` | `renewal_status` is already `renewed` |
+| `409` | `A renewal policy already exists for this policy` | Another policy already references this one via `previous_policy_id` |
+| `409` | `Policy number already exists for this company` | Duplicate `policy_number` |
+
+---
+
 ### 6.6 Update Payment Status
 
 **PATCH** `/api/v1/policies/{policy_id}/payment-status`
@@ -1098,7 +1159,7 @@ Auth required. Returns the full chronological event history for a policy — cre
 | `policy_updated` | `PUT /policies/{id}` (non-financial fields only) | — |
 | `endorsement` | `PUT /policies/{id}` (financial/date fields) or any `coverages` write — also auto-syncs commission | — |
 | `payment_status_changed` | `PATCH /policies/{id}/payment-status` | e.g. `unpaid` → `paid` |
-| `renewal_status_changed` | `PATCH /policies/{id}/renewal-status` | e.g. `pending` → `renewed` |
+| `renewal_status_changed` | `PATCH /policies/{id}/renewal-status` or `POST /policies/{id}/confirm-renewal` | e.g. `pending` → `renewed` |
 | `followup_logged` | `POST /policies/{id}/follow-ups` | — |
 
 **`reference_type` values** (when set, `reference_id` is the PK of the linked row):
@@ -1107,6 +1168,7 @@ Auth required. Returns the full chronological event history for a policy — cre
 |---|---|
 | `follow_up_logs` | The specific follow-up row |
 | `policy_coverages` | The specific coverage item added / updated / deleted |
+| `policy` | The other policy in a renewal pair (old ↔ new via `confirm-renewal`) |
 
 **`metadata`** is a JSON object present only on events that carry a before/after snapshot or structured detail:
 - `endorsement` via `PUT /policies/{id}` → `{ "before": { ... }, "after": { ... } }` (only changed fields)
