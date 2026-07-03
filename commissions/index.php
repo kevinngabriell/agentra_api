@@ -273,6 +273,7 @@ if ($action === 'summary') {
 
 } elseif ($commission_id && $sub_action === 'mark-received') {
     if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
+    requireRole($authUser, ['owner', 'admin']); // financial reconciliation — not a subagent action
     $input = json_decode(file_get_contents('php://input'), true) ?? [];
     markCommissionReceived($conn, $commission_id, $company_id, $input, $username);
 

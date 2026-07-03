@@ -17,7 +17,7 @@ function refreshToken($conn, $input) {
 
     $userId = cleanInput($payload['sub'] ?? '');
 
-    $result = mysqli_query($conn, "SELECT user_id, username, app_role_id
+    $result = mysqli_query($conn, "SELECT user_id, username, app_role_id, agentra_role, company_id
         FROM " . CORE_SCHEMA . ".app_user
         WHERE user_id = '$userId'
         LIMIT 1");
@@ -29,9 +29,11 @@ function refreshToken($conn, $input) {
     $user = mysqli_fetch_assoc($result);
 
     $claims = [
-        'sub'      => $user['user_id'],
-        'username' => $user['username'],
-        'role'     => $user['app_role_id'],
+        'sub'          => $user['user_id'],
+        'username'     => $user['username'],
+        'role'         => $user['app_role_id'],
+        'agentra_role' => $user['agentra_role'],
+        'company_id'   => $user['company_id'],
     ];
 
     jsonResponse(200, 'Token refreshed successfully', [

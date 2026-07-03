@@ -57,6 +57,37 @@ function requireAuth(): array {
     }
 }
 
+// ── Roles (Agentra-only: owner | admin | subagent) ────────────────────────────
+// Tokens issued before this feature existed carry no `agentra_role` claim —
+// default to 'owner' so already-logged-in single-user accounts keep full access.
+
+function requireRole(array $authUser, array $allowedRoles): void {
+    $role = $authUser['agentra_role'] ?? 'owner';
+    if (!in_array($role, $allowedRoles, true)) {
+        jsonResponse(403, 'You do not have permission to perform this action');
+        exit;
+    }
+}
+
+// Subagents may only write records assigned to them; owner/admin may write any
+// record in the company. Pass the resource's owning user_id (e.g.
+// policies.issuing_agent_id, customers.referred_by_agent_id) — null means no
+// owner is set on the record, which is allowed through for everyone.
+function requireOwnRecordOrAdmin(array $authUser, ?string $resourceOwnerId): void {
+    $role = $authUser['agentra_role'] ?? 'owner';
+    if (in_array($role, ['owner', 'admin'], true)) {
+        return;
+    }
+
+    $selfId = $authUser['sub'] ?? $authUser['user_id'] ?? null;
+    if ($resourceOwnerId !== null && $resourceOwnerId === $selfId) {
+        return;
+    }
+
+    jsonResponse(403, 'You can only modify records assigned to you');
+    exit;
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 function generateUUID(): string {

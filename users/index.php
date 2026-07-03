@@ -6,7 +6,7 @@ require_once __DIR__ . '/../connection/db.php';
 // --- US-001: GET /api/v1/users/me ---
 function getMe($conn, $user_id) {
     $user_id = mysqli_real_escape_string($conn, $user_id);
-    $result = mysqli_query($conn, "SELECT user_id, username, first_name, email, phone_number, language, app_role_id, account_status, created_at, updated_at FROM " . CORE_SCHEMA . ".app_user WHERE user_id = '$user_id' LIMIT 1");
+    $result = mysqli_query($conn, "SELECT user_id, username, first_name, email, phone_number, language, app_role_id, agentra_role, account_status, created_at, updated_at FROM " . CORE_SCHEMA . ".app_user WHERE user_id = '$user_id' LIMIT 1");
 
     if (!$result || mysqli_num_rows($result) === 0) {
         jsonResponse(404, 'User not found');
@@ -218,16 +218,23 @@ $method     = $_SERVER['REQUEST_METHOD'];
 $user_id    = $authUser['sub'] ?? $authUser['user_id'] ?? null;
 $company_id = $authUser['company_id'] ?? null;
 
-// $action  = $parts[3] (e.g. 'me')
-// $parts[4] = sub-action (e.g. 'password', 'notification-settings')
+// $action  = $parts[3] (e.g. 'me', 'team')
+// $parts[4] = sub-action for 'me' (e.g. 'password', 'notification-settings')
+//           = target user_id for 'team'
 $sub_action = $parts[4] ?? '';
 
-if ($action !== 'me') {
+if (!in_array($action, ['me', 'team'], true)) {
     jsonResponse(404, 'Route not found');
 }
 
 try {
     $conn = getConn();
+
+    if ($action === 'team') {
+        if (!$company_id) { jsonResponse(400, 'company_id is required'); }
+        require __DIR__ . '/team.php';
+        exit;
+    }
 
     if ($sub_action === 'password') {
         if ($method !== 'PUT') { jsonResponse(405, 'Method Not Allowed'); }

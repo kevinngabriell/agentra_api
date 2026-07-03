@@ -3,6 +3,21 @@
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 
+// Resolves the "owner" of a customer for subagent write-scoping: the referring
+// agent, falling back to whoever created the record. Returns null if the
+// customer doesn't exist under this company (the write function's own
+// existence check will 404, so letting the write through here is safe).
+function resolveCustomerOwnerId($conn, $customer_id, $company_id) {
+    $cid = mysqli_real_escape_string($conn, $customer_id);
+    $coid = mysqli_real_escape_string($conn, $company_id);
+    $res = mysqli_query($conn, "SELECT referred_by_agent_id, created_by FROM " . APP_SCHEMA . ".customers WHERE customer_id = '$cid' AND company_id = '$coid' LIMIT 1");
+    if (!$res || mysqli_num_rows($res) === 0) {
+        return null;
+    }
+    $row = mysqli_fetch_assoc($res);
+    return $row['referred_by_agent_id'] ?: $row['created_by'];
+}
+
 // --- CREATE ---
 function createCustomer($conn, $input, $username, $company_id){
     $required = ['customer_type', 'display_name'];
@@ -606,11 +621,13 @@ try {
 
     // POST /api/v1/customers/import
     if ($method === 'POST' && $action === 'import') {
+        requireRole($authUser, ['owner', 'admin']); // bulk import — not a subagent action
         importCustomers($conn, $company_id, $username);
 
     // PUT /api/v1/customers/{customer_id}/status
     } elseif ($customer_id && $sub_action === 'status') {
         if ($method !== 'PUT') { jsonResponse(405, 'Method Not Allowed'); }
+        requireOwnRecordOrAdmin($authUser, resolveCustomerOwnerId($conn, $customer_id, $company_id));
         $input = json_decode(file_get_contents('php://input'), true) ?? [];
         updateCustomerStatus($conn, $customer_id, $company_id, $input);
 
@@ -626,10 +643,12 @@ try {
                 getDetailCustomer($conn, $customer_id, $company_id);
                 break;
             case 'PUT':
+                requireOwnRecordOrAdmin($authUser, resolveCustomerOwnerId($conn, $customer_id, $company_id));
                 $input = json_decode(file_get_contents('php://input'), true) ?? [];
                 updateCustomer($conn, $customer_id, $input, $company_id);
                 break;
             case 'DELETE':
+                requireOwnRecordOrAdmin($authUser, resolveCustomerOwnerId($conn, $customer_id, $company_id));
                 deleteCustomer($conn, $customer_id, $company_id);
                 break;
             default:
@@ -649,6 +668,10 @@ try {
                 break;
             case 'POST':
                 $input = json_decode(file_get_contents('php://input'), true) ?? [];
+                // Subagents may only create customers assigned to themselves.
+                if (($authUser['agentra_role'] ?? 'owner') === 'subagent') {
+                    $input['referred_by_agent_id'] = $username;
+                }
                 createCustomer($conn, $input, $username, $company_id);
                 break;
             default:

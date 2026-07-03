@@ -286,7 +286,29 @@ Auth required.
 
 ---
 
-## 3. User Profile
+## 3. User Profile & Roles
+
+### 3.0 Roles & Permissions
+
+Every company (agency) can have multiple logins sharing the same `company_id`,
+distinguished by `agentra_role`:
+
+| Role | Read | Write |
+|---|---|---|
+| `owner` | Everything in the company | Everything in the company. Created via `/auth/register`; cannot be demoted or deactivated. |
+| `admin` | Everything in the company | Everything in the company, plus managing team members (invite/change role/deactivate) and master config (insurers, master products, commission rates). |
+| `subagent` | Everything in the company (policies, customers, commissions, dashboard, etc. are not filtered by role) | Only policies/customers **assigned to them** — `policies.issuing_agent_id` / `customers.referred_by_agent_id` must equal their own `user_id`. Creating a new policy/customer as a subagent automatically assigns it to themselves, ignoring any different `issuing_agent_id`/`referred_by_agent_id` sent in the request. Cannot manage master config, team members, or financial reconciliation (payment-status, mark-received, bulk import). |
+
+`agentra_role` is returned by `/auth/login` and `/auth/refresh` inside the JWT,
+and by `GET /users/me`, and is enforced server-side on every write endpoint. It
+is **not** the same field as `app_role_id`, which belongs to a different,
+shared part of the platform and is not read for authorization in this API.
+
+A `403 You do not have permission to perform this action` (role gate) or
+`403 You can only modify records assigned to you` (ownership gate) means the
+current role doesn't allow that request.
+
+---
 
 ### 3.1 Get My Profile
 
@@ -373,6 +395,77 @@ Auth required.
 | monthly_digest_enabled | boolean | No | Enable monthly digest |
 | monthly_digest_day | integer | No | Day of month, 1–28 |
 | monthly_digest_time | string | No | HH:MM format |
+
+---
+
+### 3.5 Team Management
+
+`owner`/`admin` only (see §3.0). Manages the admins and subagents under the
+caller's own `company_id`.
+
+#### 3.5.1 List Team Members
+
+**GET** `/api/v1/users/team`
+
+**Response `200`:**
+```json
+{
+  "data": {
+    "items": [
+      { "user_id": "usr_xxx", "username": "owner@agency.com", "first_name": "Budi", "email": "owner@agency.com", "phone_number": "0812...", "agentra_role": "owner", "account_status": "verified", "created_at": "2026-01-01 00:00:00" },
+      { "user_id": "usr_yyy", "username": "admin@agency.com", "first_name": "Sari", "email": "admin@agency.com", "phone_number": "0813...", "agentra_role": "admin", "account_status": "verified", "created_at": "2026-02-01 00:00:00" }
+    ]
+  }
+}
+```
+
+#### 3.5.2 Invite a Team Member
+
+**POST** `/api/v1/users/team`
+
+**Request Body:**
+```json
+{
+  "name": "Sari",
+  "email": "sari@agency.com",
+  "password": "password123",
+  "password_confirmation": "password123",
+  "phone": "081234567891",
+  "agentra_role": "subagent"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| name | string | Yes | Display name |
+| email | string | Yes | Used as username/login |
+| password, password_confirmation | string | Yes | Min 8 characters, must match |
+| phone | string | Yes | Must be unique within the app |
+| agentra_role | string | Yes | `admin` or `subagent` only — `owner` cannot be created this way |
+
+**Response `201`:**
+```json
+{ "data": { "user_id": "usr_zzz", "email": "sari@agency.com", "agentra_role": "subagent" } }
+```
+
+#### 3.5.3 Change a Team Member's Role
+
+**PATCH** `/api/v1/users/team/{user_id}/role`
+
+**Request Body:**
+```json
+{ "agentra_role": "admin" }
+```
+
+`403` if `{user_id}` is the company owner.
+
+#### 3.5.4 Deactivate a Team Member
+
+**DELETE** `/api/v1/users/team/{user_id}`
+
+Sets `account_status = 'inactive'` (soft delete — preserves their history as
+`issuing_agent_id`/`created_by` on existing records). `400` if targeting your
+own account; `403` if targeting the company owner.
 
 ---
 

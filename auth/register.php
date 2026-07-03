@@ -83,8 +83,8 @@ function createNewCompany($conn, $input){
     }
 
     mysqli_query($conn, "INSERT INTO " . CORE_SCHEMA . ".app_user
-        (user_id, username, first_name, email, password, phone_number, account_status, app_id, app_role_id, company_id)
-        VALUES ('$userId', '$email', '$name', '$email', '$hashedPassword', '$phone', 'verified', '$appId', '$appRoleId', '$companyId')");
+        (user_id, username, first_name, email, password, phone_number, account_status, app_id, app_role_id, agentra_role, company_id)
+        VALUES ('$userId', '$email', '$name', '$email', '$hashedPassword', '$phone', 'verified', '$appId', '$appRoleId', 'owner', '$companyId')");
     if (mysqli_errno($conn)) {
         jsonResponse(500, 'Gagal membuat akun: ' . mysqli_error($conn));
     }

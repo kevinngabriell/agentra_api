@@ -46,6 +46,21 @@ function resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_
     return null;
 }
 
+// Resolves the "owner" of a policy for subagent write-scoping: the issuing agent,
+// falling back to whoever created the record. Returns null if the policy doesn't
+// exist under this company (the underlying write function will 404 on its own
+// existence check, so letting the write through here is safe).
+function resolvePolicyOwnerId($conn, $policy_id, $company_id) {
+    $pid = mysqli_real_escape_string($conn, $policy_id);
+    $cid = mysqli_real_escape_string($conn, $company_id);
+    $res = mysqli_query($conn, "SELECT issuing_agent_id, created_by FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$pid' AND company_id = '$cid' LIMIT 1");
+    if (!$res || mysqli_num_rows($res) === 0) {
+        return null;
+    }
+    $row = mysqli_fetch_assoc($res);
+    return $row['issuing_agent_id'] ?: $row['created_by'];
+}
+
 // --- GET ALL (PO-001) ---
 function getAllPolicies($conn, $company_id, $params){
     $page           = max(1, (int)($params['page']   ?? 1));
@@ -1209,21 +1224,28 @@ try {
         switch ($sub_action) {
             case 'renewal-status':
                 if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
+                requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
                 updateRenewalStatus($conn, $policy_id, $company_id, $input, $username);
                 break;
             case 'confirm-renewal':
                 if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+                requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
                 confirmRenewal($conn, $policy_id, $company_id, $input, $username);
                 break;
             case 'follow-ups':
                 if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+                requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
                 addFollowUp($conn, $policy_id, $company_id, $input, $username);
                 break;
             case 'payment-status':
                 if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
+                requireRole($authUser, ['owner', 'admin']); // financial reconciliation — not a subagent action
                 updatePaymentStatus($conn, $policy_id, $company_id, $input, $username);
                 break;
             case 'coverages':
+                if (in_array($method, ['POST', 'PUT', 'DELETE'], true)) {
+                    requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
+                }
                 require __DIR__ . '/coverages.php';
                 break;
             case 'commission':
@@ -1232,6 +1254,9 @@ try {
                 break;
             // [NEW v1.1] Co-assurance participants for this policy.
             case 'coassurance':
+                if (in_array($method, ['POST', 'PUT', 'DELETE'], true)) {
+                    requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
+                }
                 require __DIR__ . '/coassurance.php';
                 break;
             case 'logs':
@@ -1249,14 +1274,17 @@ try {
                 getDetailPolicy($conn, $policy_id, $company_id);
                 break;
             case 'PUT':
+                requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
                 $input = json_decode(file_get_contents('php://input'), true) ?? [];
                 updatePolicy($conn, $policy_id, $input, $username, $company_id);
                 break;
             case 'PATCH':
+                requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
                 $input = json_decode(file_get_contents('php://input'), true) ?? [];
                 directUpdatePolicy($conn, $policy_id, $input, $username, $company_id);
                 break;
             case 'DELETE':
+                requireOwnRecordOrAdmin($authUser, resolvePolicyOwnerId($conn, $policy_id, $company_id));
                 deletePolicy($conn, $policy_id, $company_id);
                 break;
             default:
@@ -1271,6 +1299,10 @@ try {
                 break;
             case 'POST':
                 $input = json_decode(file_get_contents('php://input'), true) ?? [];
+                // Subagents may only create policies assigned to themselves.
+                if (($authUser['agentra_role'] ?? 'owner') === 'subagent') {
+                    $input['issuing_agent_id'] = $username;
+                }
                 createPolicy($conn, $input, $username, $company_id);
                 break;
             default:

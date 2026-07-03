@@ -194,6 +194,11 @@ $method     = $_SERVER['REQUEST_METHOD'];
 $company_id = $authUser['company_id'] ?? null;
 $username   = $authUser['sub'] ?? $authUser['user_id'] ?? null;
 
+// Insurers are shared master config for the whole company — subagents can read, not write.
+if (in_array($method, ['POST', 'PUT', 'DELETE'], true)) {
+    requireRole($authUser, ['owner', 'admin']);
+}
+
 if (!$company_id) {
     jsonResponse(400, 'company_id is required');
     exit;
