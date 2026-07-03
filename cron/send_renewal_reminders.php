@@ -2,11 +2,12 @@
 // CLI-only. Meant to run once a day at 09:00 Asia/Jakarta (WIB) via the VPS crontab.
 // See cron/README.md for the crontab line and setup notes.
 //
-// Sends a WhatsApp reminder to the AGENT (issuing_agent_id, falling back to
-// created_by) of every pending-renewal policy that is expiring in exactly 30, 20,
-// or 10 days, or in fewer than 10 days (sent daily while it stays under 10 and
-// hasn't expired), so the agent can follow up with the customer to confirm
-// renewal. Each send is logged to follow_up_logs so a re-run on the same day
+// Sends ONE consolidated WhatsApp message per AGENT (issuing_agent_id, falling back
+// to created_by) listing every pending-renewal policy of theirs expiring in exactly
+// 30, 20, or 10 days, or in fewer than 10 days (included daily while it stays under
+// 10 and hasn't expired) — so an agent with 100+ policies due gets a short digest
+// instead of 100 separate messages. Long lists are paginated into multiple messages.
+// Each policy's reminder is logged to follow_up_logs so a re-run on the same day
 // never double-sends.
 
 if (php_sapi_name() !== 'cli') {
@@ -19,21 +20,26 @@ require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../notification/notification.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
 
-function renewalReminderMessage(int $daysLeft, string $agentName, string $customerName, string $policyNumber, string $productName, string $coverageEndFormatted): string {
+const MAX_POLICIES_PER_MESSAGE = 25;
+
+function renewalReminderDigest(string $agentName, array $lines, int $pageNum, int $totalPages, int $totalPolicies): string {
     $greetingName = $agentName !== '' ? $agentName : 'Agent';
+    $pageSuffix   = $totalPages > 1 ? " (Bagian {$pageNum}/{$totalPages})" : '';
 
-    if ($daysLeft >= 10) {
-        return "Halo {$greetingName}! 👋\n\n"
-            . "Polis *{$productName}* nomor *{$policyNumber}* milik *{$customerName}* akan berakhir pada *{$coverageEndFormatted}* ({$daysLeft} hari lagi).\n\n"
-            . "Mohon hubungi pelanggan untuk proses konfirmasi perpanjangan (renewal) polis sebelum masa berlaku habis.\n\n"
-            . "Terima kasih! 🙏";
-    }
-
-    return "Halo {$greetingName}! ⚠️\n\n"
-        . "Polis *{$productName}* nomor *{$policyNumber}* milik *{$customerName}* akan segera berakhir pada *{$coverageEndFormatted}* "
-        . ($daysLeft > 0 ? "(tinggal {$daysLeft} hari lagi)" : "(hari ini)") . ".\n\n"
-        . "Mohon segera hubungi pelanggan untuk konfirmasi perpanjangan polis agar perlindungan tidak terputus.\n\n"
+    $body = "Halo {$greetingName}! 👋{$pageSuffix}\n\n"
+        . "Berikut polis yang perlu segera di-follow up untuk konfirmasi perpanjangan (renewal):\n\n"
+        . implode("\n", $lines)
+        . "\n\nMohon segera hubungi masing-masing pelanggan di atas.\n"
+        . "Total polis butuh follow up: {$totalPolicies}\n\n"
         . "Terima kasih! 🙏";
+
+    return $body;
+}
+
+function renewalLine(int $num, int $daysLeft, string $customerName, string $policyNumber, string $productName, string $coverageEndFormatted): string {
+    $tag = $daysLeft < 10 ? '⚠️ SEGERA' : "H-{$daysLeft}";
+    $dayText = $daysLeft > 0 ? "{$daysLeft} hari lagi" : 'hari ini';
+    return "{$num}. [{$tag}] {$customerName} — {$policyNumber} ({$productName}), berakhir {$coverageEndFormatted}, {$dayText}";
 }
 
 $conn = getConn();
@@ -67,14 +73,15 @@ if (!$result) {
     exit(1);
 }
 
-$today = date('Y-m-d');
-$sent  = 0;
-$skipped_no_agent_whatsapp = 0;
-$skipped_already_sent = 0;
+$today                      = date('Y-m-d');
+$skipped_no_agent_whatsapp  = 0;
+$skipped_already_sent       = 0;
+
+// Group every policy still needing a reminder today under its agent's phone number.
+$byAgent = [];
 
 while ($policy = mysqli_fetch_assoc($result)) {
-    $policy_id  = mysqli_real_escape_string($conn, $policy['policy_id']);
-    $company_id = mysqli_real_escape_string($conn, $policy['company_id']);
+    $policy_id = mysqli_real_escape_string($conn, $policy['policy_id']);
 
     $already = mysqli_query($conn, "
         SELECT 1 FROM " . APP_SCHEMA . ".follow_up_logs
@@ -95,38 +102,85 @@ while ($policy = mysqli_fetch_assoc($result)) {
         continue;
     }
 
-    $phone  = preg_replace('/[^0-9]/', '', $agentPhone);
-    $chatId = "{$phone}@c.us";
+    $phone = preg_replace('/[^0-9]/', '', $agentPhone);
 
     $customerName = $policy['customer_type'] === 'company'
         ? ($policy['company_legal_name'] ?: $policy['display_name'])
         : $policy['display_name'];
 
-    $daysLeft   = (int)$policy['days_left'];
-    $coverageEndFormatted = date('d/m/Y', strtotime($policy['coverage_end']));
+    if (!isset($byAgent[$phone])) {
+        $byAgent[$phone] = ['name' => $agentName, 'policies' => []];
+    }
 
-    $text = renewalReminderMessage($daysLeft, $agentName, (string)$customerName, $policy['policy_number'], $policy['product_name'], $coverageEndFormatted);
-
-    $response = sendWhatsAppText($chatId, $text);
-
-    $bucket_label = in_array($daysLeft, [30, 20, 10], true) ? "H-{$daysLeft}" : "H-{$daysLeft} (urgent)";
-    $now          = date('Y-m-d H:i:s');
-    $followup_id  = 'fu_' . uniqid();
-    $status       = $response['success'] ? 'contacted' : 'no_response';
-    $notes        = mysqli_real_escape_string($conn,
-        ($response['success'] ? "Reminder renewal ke agent otomatis terkirim ({$bucket_label})" : "Reminder renewal ke agent otomatis gagal terkirim ({$bucket_label})")
-    );
-
-    mysqli_query($conn, "
-        INSERT INTO " . APP_SCHEMA . ".follow_up_logs
-            (followup_id, policy_id, followup_status, channel, notes, followup_date, created_by, created_at)
-        VALUES
-            ('$followup_id', '$policy_id', '$status', 'whatsapp_reminder', '$notes', '$today', 'system_cron', '$now')
-    ");
-    insertPolicyLog($conn, $policy_id, $company_id, 'followup_logged', $notes, 'system_cron', null, null, 'follow_up_logs', $followup_id);
-
-    $sent++;
-    usleep(300000); // small delay between sends to stay friendly to the WAHA session
+    $byAgent[$phone]['policies'][] = [
+        'policy_id'      => $policy['policy_id'],
+        'company_id'     => $policy['company_id'],
+        'days_left'      => (int)$policy['days_left'],
+        'customer_name'  => (string)$customerName,
+        'policy_number'  => $policy['policy_number'],
+        'product_name'   => $policy['product_name'],
+        'coverage_end'   => date('d/m/Y', strtotime($policy['coverage_end'])),
+    ];
 }
 
-echo "Renewal reminders done: sent={$sent}, skipped_no_agent_whatsapp={$skipped_no_agent_whatsapp}, skipped_already_sent_today={$skipped_already_sent}" . PHP_EOL;
+$agents_notified = 0;
+$policies_sent    = 0;
+$messages_sent    = 0;
+
+foreach ($byAgent as $phone => $agentData) {
+    $policies = $agentData['policies'];
+    usort($policies, fn($a, $b) => $a['days_left'] <=> $b['days_left']);
+
+    $chatId      = "{$phone}@c.us";
+    $totalCount  = count($policies);
+    $pages       = array_chunk($policies, MAX_POLICIES_PER_MESSAGE);
+    $totalPages  = count($pages);
+    $agentNotified = false;
+
+    foreach ($pages as $pageIndex => $pagePolicies) {
+        $lines = [];
+        foreach ($pagePolicies as $i => $p) {
+            $lines[] = renewalLine($i + 1, $p['days_left'], $p['customer_name'], $p['policy_number'], $p['product_name'], $p['coverage_end']);
+        }
+
+        $text     = renewalReminderDigest($agentData['name'], $lines, $pageIndex + 1, $totalPages, $totalCount);
+        $response = sendWhatsAppText($chatId, $text);
+        $messages_sent++;
+
+        $now    = date('Y-m-d H:i:s');
+        $status = $response['success'] ? 'contacted' : 'no_response';
+
+        foreach ($pagePolicies as $p) {
+            $policy_id   = mysqli_real_escape_string($conn, $p['policy_id']);
+            $company_id  = mysqli_real_escape_string($conn, $p['company_id']);
+            $bucket      = $p['days_left'] < 10 ? "urgent H-{$p['days_left']}" : "H-{$p['days_left']}";
+            $followup_id = 'fu_' . uniqid();
+            $notes       = mysqli_real_escape_string($conn,
+                ($response['success']
+                    ? "Reminder renewal ke agent otomatis terkirim ({$bucket}, digest)"
+                    : "Reminder renewal ke agent otomatis gagal terkirim ({$bucket}, digest)")
+            );
+
+            mysqli_query($conn, "
+                INSERT INTO " . APP_SCHEMA . ".follow_up_logs
+                    (followup_id, policy_id, followup_status, channel, notes, followup_date, created_by, created_at)
+                VALUES
+                    ('$followup_id', '$policy_id', '$status', 'whatsapp_reminder', '$notes', '$today', 'system_cron', '$now')
+            ");
+            insertPolicyLog($conn, $policy_id, $company_id, 'followup_logged', $notes, 'system_cron', null, null, 'follow_up_logs', $followup_id);
+
+            $policies_sent++;
+        }
+
+        $agentNotified = true;
+        usleep(300000); // small delay between sends to stay friendly to the WAHA session
+    }
+
+    if ($agentNotified) {
+        $agents_notified++;
+    }
+}
+
+echo "Renewal reminders done: agents_notified={$agents_notified}, messages_sent={$messages_sent}, "
+    . "policies_included={$policies_sent}, skipped_no_agent_whatsapp={$skipped_no_agent_whatsapp}, "
+    . "skipped_already_sent_today={$skipped_already_sent}" . PHP_EOL;
