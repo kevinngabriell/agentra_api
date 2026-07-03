@@ -1,7 +1,8 @@
 # Renewal Reminder Cron Job
 
-`send_renewal_reminders.php` sends a WhatsApp reminder (via WAHA) to the customer of
-every policy that is still `renewal_status = 'pending'` and expiring:
+`send_renewal_reminders.php` sends a WhatsApp reminder (via WAHA) to the **agent**
+(not the customer directly) of every policy that is still `renewal_status = 'pending'`
+and expiring:
 
 - in exactly **30**, **20**, or **10** days — one reminder each
 - in **fewer than 10** days (including today) — sent **every day** until the policy
@@ -46,7 +47,7 @@ php cron/send_renewal_reminders.php
 Prints a one-line summary, e.g.:
 
 ```
-Renewal reminders done: sent=3, skipped_no_whatsapp=1, skipped_already_sent_today=0
+Renewal reminders done: sent=3, skipped_no_agent_whatsapp=1, skipped_already_sent_today=0
 ```
 
 ## Notes
@@ -54,7 +55,8 @@ Renewal reminders done: sent=3, skipped_no_whatsapp=1, skipped_already_sent_toda
 - Requires `.env` to have `WAHA_BASE_URL`, `WAHA_SESSION`, `WAHA_API_KEY` set (see
   `notification/WHATSAPP_WAHA_GUIDE.md`).
 - Runs across **all companies** in one pass — there's no per-tenant scheduling.
-- Customer WhatsApp number is `personal_whatsapp` (individual) or `pic_whatsapp`
-  (company), whichever is set.
-- Policies with no WhatsApp number on file are skipped and counted in
-  `skipped_no_whatsapp`.
+- Recipient is the policy's `issuing_agent_id`, falling back to whoever `created_by`
+  the policy if no issuing agent is set. Their number comes from
+  `app_user.phone_number` (same field used for the OTP WhatsApp flow).
+- Policies whose agent (and fallback creator) have no phone number on file are
+  skipped and counted in `skipped_no_agent_whatsapp`.
