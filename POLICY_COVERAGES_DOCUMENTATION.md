@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS `policy_coverages` (
   `sum_insured`     bigint        NOT NULL DEFAULT 0 COMMENT 'Uang pertanggungan in IDR',
   `rate_permille`   decimal(8,4)  NOT NULL DEFAULT 0 COMMENT 'Per-mille rate e.g. 2.28 means 2.28‰',
   `premium_amount`  bigint        NOT NULL DEFAULT 0 COMMENT 'sum_insured × rate_permille / 1000',
+  `count_in_tsi`    tinyint(1)    NOT NULL DEFAULT 1 COMMENT '1 = UP counts toward policy TSI; 0 = premium only',
   `created_by`      varchar(50)   NOT NULL,
   `created_at`      datetime      NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_by`      varchar(50)   DEFAULT NULL,
@@ -61,8 +62,8 @@ CREATE TABLE IF NOT EXISTS `policy_coverages` (
 Every time a coverage item is **added, updated, or deleted**, the API automatically recalculates:
 
 ```
-policies.sum_insured    = SUM(policy_coverages.sum_insured)    WHERE policy_id = ?
-policies.premium_amount = SUM(policy_coverages.premium_amount) WHERE policy_id = ?
+policies.sum_insured    = SUM(sum_insured WHERE count_in_tsi = 1)  -- only rows flagged to count
+policies.premium_amount = SUM(premium_amount)                       -- all rows always
 ```
 
 You never need to send `sum_insured` or `premium_amount` to the policies endpoints directly — they are derived automatically from the coverage breakdown.
@@ -147,6 +148,7 @@ POST /api/v1/policies/{policy_id}/coverages
 | `coverage_label` | string | No | Custom label, e.g. "Stok 1", "Stok 2" |
 | `sum_insured` | int | Yes | Uang pertanggungan in IDR (full value, e.g. `500000000` for 500 JT) |
 | `rate_permille` | decimal | Yes | Rate in ‰ (e.g. `2.28` not `0.00228`) |
+| `count_in_tsi` | boolean | No | Default `true`. Set `false` for additional clauses (RSMD, OTHERS) on the same object so the UP is not double-counted in the policy TSI. Premium is still calculated on the full `sum_insured`. |
 
 **Response `201`:**
 ```json
@@ -184,6 +186,7 @@ All fields are optional — send only what changes.
 | `coverage_label` | string | No | Change the label |
 | `sum_insured` | int | No | New sum insured |
 | `rate_permille` | decimal | No | New rate in ‰ |
+| `count_in_tsi` | boolean | No | Toggle whether this row's UP counts toward policy TSI |
 
 **Response `200`:**
 ```json
@@ -444,5 +447,6 @@ async function reloadCoverages() {
 2. **`premium_amount` is always computed server-side** — never send it in POST/PUT.
 3. **`policies.sum_insured` and `policies.premium_amount` are auto-synced** after every coverage change — no need to update the parent policy separately.
 4. **Multiple rows of the same `coverage_type` are allowed** — use `coverage_label` to distinguish them (e.g. two `stok` rows labeled "Stok 1" and "Stok 2").
-5. **Deleting all coverage items** sets the policy totals to 0, it does not delete the policy itself.
-6. **Deleting a policy** (`ON DELETE CASCADE`) automatically removes all its coverage items.
+5. **Multiple clauses on the same object** (e.g. Building FLEXAS + Building RSMD + Building OTHERS all at 750 JT) — set `count_in_tsi: false` on the 2nd and 3rd rows. All three premiums are still calculated correctly; only the first row's 750 JT is added to TSI so the policy doesn't show 2.25B instead of 750M.
+6. **Deleting all coverage items** sets the policy totals to 0, it does not delete the policy itself.
+7. **Deleting a policy** (`ON DELETE CASCADE`) automatically removes all its coverage items.

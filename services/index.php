@@ -1,8 +1,13 @@
 <?php
 require_once __DIR__ . '/../general.php';
 
-$authUser = requireAuth();
-$method   = $_SERVER['REQUEST_METHOD'];
+// $action = $parts[3] — e.g. 'renewal-reminder'
+switch ($action) {
+    case 'renewal-reminder':
+        require __DIR__ . '/renewal-reminder.php';
+        break;
 
-// TODO: implement CRUD for services
-jsonResponse(501, 'Not implemented yet');
+    default:
+        $authUser = requireAuth();
+        jsonResponse(501, 'Not implemented yet');
+}

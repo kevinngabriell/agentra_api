@@ -1,6 +1,9 @@
 <?php
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/policy_log.php';
+require_once __DIR__ . '/../helpers/renewal_message.php';
+require_once __DIR__ . '/../notification/notification.php';
 
 // --- RN-001: GET /api/v1/renewals?month=YYYY-MM ---
 // List of policies expiring in the given month with renewal tracking info
@@ -100,34 +103,120 @@ function getRenewalStats($conn, $company_id, $month) {
     ]);
 }
 
+// --- RN-003: POST /api/v1/renewals/{policy_id}/send-whatsapp [NEW v1.1] ---
+// Sends (or previews) a renewal follow-up WhatsApp message to the customer.
+// Body: { message?: string } — overrides the saved default template for this send only.
+function sendRenewalWhatsApp($conn, $policy_id, $company_id, $input, $username) {
+    if (!$policy_id) {
+        jsonResponse(400, 'policy_id is required');
+        return;
+    }
+
+    $policy_id = mysqli_real_escape_string($conn, $policy_id);
+
+    $result = mysqli_query($conn, "SELECT
+            p.policy_id, p.policy_number, p.product_type, p.coverage_end,
+            DATEDIFF(p.coverage_end, CURDATE()) AS days_until_expiry,
+            c.customer_type, c.display_name AS customer_name,
+            c.personal_whatsapp, c.pic_whatsapp,
+            i.short_name AS insurer_name
+        FROM " . APP_SCHEMA . ".policies p
+        LEFT JOIN " . APP_SCHEMA . ".customers c ON c.customer_id = p.customer_id
+        LEFT JOIN " . APP_SCHEMA . ".insurers  i ON i.insurer_id  = p.insurer_id
+        WHERE p.policy_id = '$policy_id' AND p.company_id = '$company_id'
+        LIMIT 1");
+
+    if (!$result || mysqli_num_rows($result) === 0) {
+        jsonResponse(404, 'Policy not found');
+        return;
+    }
+
+    $row = mysqli_fetch_assoc($result);
+
+    $waNumber = $row['customer_type'] === 'company' ? $row['pic_whatsapp'] : $row['personal_whatsapp'];
+    if (!$waNumber) {
+        jsonResponse(400, 'Customer has no WhatsApp number on file');
+        return;
+    }
+
+    $template = DEFAULT_RENEWAL_WA_TEMPLATE;
+    $settingsRes = mysqli_query($conn, "SELECT renewal_wa_message_template FROM " . APP_SCHEMA . ".notification_settings WHERE company_id = '$company_id' LIMIT 1");
+    if ($settingsRes && mysqli_num_rows($settingsRes) > 0) {
+        $saved = mysqli_fetch_assoc($settingsRes)['renewal_wa_message_template'];
+        if ($saved) { $template = $saved; }
+    }
+
+    // Per-send override always wins, but is still run through placeholder substitution.
+    if (!empty($input['message']) && trim($input['message']) !== '') {
+        $template = trim($input['message']);
+    }
+
+    $message = renderRenewalMessage($template, $row);
+    $chatId  = toWaChatId($waNumber);
+    if (!$chatId) {
+        jsonResponse(400, 'Customer WhatsApp number is invalid');
+        return;
+    }
+
+    $sendResult = sendWhatsAppText($chatId, $message);
+    if (empty($sendResult['success'])) {
+        $error = $sendResult['error'] ?? $sendResult;
+        insertPolicyLog($conn, $policy_id, $company_id, 'whatsapp_send_failed',
+            'Gagal mengirim WhatsApp renewal reminder', $username,
+            null, null, null, null, ['chatId' => $chatId, 'error' => $error]);
+        jsonResponse(502, 'Failed to send WhatsApp message', ['error' => $error]);
+        return;
+    }
+
+    // Log as a follow-up so it shows on the policy timeline, consistent with manual follow-up entries.
+    $followup_id = 'fu_' . uniqid();
+    $now         = date('Y-m-d H:i:s');
+    $notes       = mysqli_real_escape_string($conn, $message);
+    mysqli_query($conn, "INSERT INTO " . APP_SCHEMA . ".follow_up_logs
+        (followup_id, policy_id, followup_status, channel, notes, followup_date, created_by, created_at)
+        VALUES ('$followup_id', '$policy_id', 'contacted', 'whatsapp', '$notes', CURDATE(), '$username', '$now')");
+
+    insertPolicyLog($conn, $policy_id, $company_id, 'followup_logged',
+        'Follow-up dicatat via whatsapp: contacted', $username,
+        null, null, 'follow_up_logs', $followup_id, ['message' => $message]);
+
+    jsonResponse(200, 'WhatsApp message sent', ['message' => $message, 'followup_id' => $followup_id]);
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 $authUser   = requireAuth();
 $method     = $_SERVER['REQUEST_METHOD'];
 $company_id = $authUser['company_id'] ?? null;
+$username   = $authUser['user_id']    ?? $authUser['sub'] ?? null;
 
 if (!$company_id) {
     jsonResponse(400, 'company_id is required');
     exit;
 }
 
-if ($method !== 'GET') {
-    jsonResponse(405, 'Method Not Allowed');
-    exit;
-}
-
-$month = isset($_GET['month']) && preg_match('/^\d{4}-\d{2}$/', $_GET['month'])
-    ? $_GET['month']
-    : date('Y-m');
+// $action     = $parts[3] — 'stats', a policy_id, or '' (list)
+// $sub_action = $parts[4] — 'send-whatsapp'
+$sub_action = $parts[4] ?? '';
 
 try {
     $conn = getConn();
 
+    // POST /api/v1/renewals/{policy_id}/send-whatsapp
+    if ($action !== '' && $action !== 'stats' && $sub_action === 'send-whatsapp') {
+        if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+        $input = json_decode(file_get_contents('php://input'), true) ?? [];
+        sendRenewalWhatsApp($conn, $action, $company_id, $input, $username);
+
     // GET /api/v1/renewals/stats
-    if ($action === 'stats') {
+    } elseif ($action === 'stats') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        $month = isset($_GET['month']) && preg_match('/^\d{4}-\d{2}$/', $_GET['month']) ? $_GET['month'] : date('Y-m');
         getRenewalStats($conn, $company_id, $month);
 
     // GET /api/v1/renewals
     } elseif ($action === '') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        $month = isset($_GET['month']) && preg_match('/^\d{4}-\d{2}$/', $_GET['month']) ? $_GET['month'] : date('Y-m');
         $renewal_status = isset($_GET['renewal_status'])
             ? mysqli_real_escape_string($conn, $_GET['renewal_status'])
             : '';

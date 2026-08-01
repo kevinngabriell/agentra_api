@@ -102,6 +102,24 @@ function changePassword($conn, $user_id, $input) {
     }
 }
 
+// --- US-004b: GET /api/v1/users/me/notification-settings [NEW v1.1] ---
+function getNotificationSettings($conn, $company_id) {
+    $company_id = mysqli_real_escape_string($conn, $company_id);
+
+    $result = mysqli_query($conn, "SELECT * FROM " . APP_SCHEMA . ".notification_settings WHERE company_id = '$company_id' LIMIT 1");
+    if (!$result || mysqli_num_rows($result) === 0) {
+        jsonResponse(404, 'Notification settings not configured yet');
+        return;
+    }
+
+    $row = mysqli_fetch_assoc($result);
+    $row['daily_digest_enabled']   = (bool)(int)$row['daily_digest_enabled'];
+    $row['monthly_digest_enabled'] = (bool)(int)$row['monthly_digest_enabled'];
+    $row['renewal_reminder_days']  = (int)$row['renewal_reminder_days'];
+
+    jsonResponse(200, 'Notification settings retrieved', $row);
+}
+
 // --- US-004: PUT /api/v1/users/me/notification-settings ---
 function updateNotificationSettings($conn, $user_id, $company_id, $input) {
     $user_id    = mysqli_real_escape_string($conn, $user_id);
@@ -170,6 +188,25 @@ function updateNotificationSettings($conn, $user_id, $company_id, $input) {
         $updates[] = "whatsapp_target_number = '$wa'";
     }
 
+    // [NEW v1.1] Days before coverage_end to trigger the automatic renewal WA reminder to the agent.
+    if (isset($input['renewal_reminder_days'])) {
+        $days = (int)$input['renewal_reminder_days'];
+        if ($days < 1 || $days > 90) {
+            jsonResponse(400, 'renewal_reminder_days must be between 1 and 90');
+            return;
+        }
+        $updates[] = "renewal_reminder_days = $days";
+    }
+
+    // [NEW v1.1] Agent-editable default message for the manual "Send WhatsApp" renewal action.
+    // Placeholders: {customer_name} {policy_number} {product_type} {insurer_name} {coverage_end} {days_until_expiry}
+    if (isset($input['renewal_wa_message_template'])) {
+        $tpl = trim($input['renewal_wa_message_template']);
+        $updates[] = $tpl !== ''
+            ? "renewal_wa_message_template = '" . mysqli_real_escape_string($conn, $tpl) . "'"
+            : "renewal_wa_message_template = NULL";
+    }
+
     if (mysqli_num_rows($check) > 0) {
         if (empty($updates)) {
             jsonResponse(400, 'No fields provided for update');
@@ -198,11 +235,16 @@ function updateNotificationSettings($conn, $user_id, $company_id, $input) {
         $monthly_enabled = isset($input['monthly_digest_enabled'])? ($input['monthly_digest_enabled'] ? 1 : 0) : 1;
         $monthly_day     = isset($input['monthly_digest_day'])    ? (int)$input['monthly_digest_day'] : 1;
         $monthly_time    = isset($input['monthly_digest_time'])   ? trim(mysqli_real_escape_string($conn, $input['monthly_digest_time'])) : '08:00:00';
+        // [NEW v1.1]
+        $reminder_days   = isset($input['renewal_reminder_days'])     ? max(1, min(90, (int)$input['renewal_reminder_days'])) : 30;
+        $wa_template     = isset($input['renewal_wa_message_template']) && trim($input['renewal_wa_message_template']) !== ''
+            ? "'" . mysqli_real_escape_string($conn, trim($input['renewal_wa_message_template'])) . "'"
+            : 'NULL';
 
         $sql = "INSERT INTO " . APP_SCHEMA . ".notification_settings
-            (setting_id, company_id, user_id, daily_digest_enabled, daily_digest_time, daily_days_of_week, monthly_digest_enabled, monthly_digest_day, monthly_digest_time, whatsapp_target_number, updated_by)
+            (setting_id, company_id, user_id, daily_digest_enabled, daily_digest_time, daily_days_of_week, monthly_digest_enabled, monthly_digest_day, monthly_digest_time, whatsapp_target_number, renewal_reminder_days, renewal_wa_message_template, updated_by)
             VALUES
-            ('$setting_id', '$company_id', '$user_id', $daily_enabled, '$daily_time', '$daily_days', $monthly_enabled, $monthly_day, '$monthly_time', '$wa', '$user_id')";
+            ('$setting_id', '$company_id', '$user_id', $daily_enabled, '$daily_time', '$daily_days', $monthly_enabled, $monthly_day, '$monthly_time', '$wa', $reminder_days, $wa_template, '$user_id')";
 
         if (mysqli_query($conn, $sql)) {
             jsonResponse(201, 'Notification settings created successfully');
@@ -235,10 +277,15 @@ try {
         changePassword($conn, $user_id, $input);
 
     } elseif ($sub_action === 'notification-settings') {
-        if ($method !== 'PUT') { jsonResponse(405, 'Method Not Allowed'); }
         if (!$company_id) { jsonResponse(400, 'company_id is required'); }
-        $input = json_decode(file_get_contents('php://input'), true) ?? [];
-        updateNotificationSettings($conn, $user_id, $company_id, $input);
+        if ($method === 'GET') {
+            getNotificationSettings($conn, $company_id);
+        } elseif ($method === 'PUT') {
+            $input = json_decode(file_get_contents('php://input'), true) ?? [];
+            updateNotificationSettings($conn, $user_id, $company_id, $input);
+        } else {
+            jsonResponse(405, 'Method Not Allowed');
+        }
 
     } elseif ($sub_action === '') {
         switch ($method) {
