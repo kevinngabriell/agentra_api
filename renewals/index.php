@@ -160,7 +160,11 @@ function sendRenewalWhatsApp($conn, $policy_id, $company_id, $input, $username) 
 
     $sendResult = sendWhatsAppText($chatId, $message);
     if (empty($sendResult['success'])) {
-        jsonResponse(502, 'Failed to send WhatsApp message', ['error' => $sendResult['error'] ?? $sendResult]);
+        $error = $sendResult['error'] ?? $sendResult;
+        insertPolicyLog($conn, $policy_id, $company_id, 'whatsapp_send_failed',
+            'Gagal mengirim WhatsApp renewal reminder', $username,
+            null, null, null, null, ['chatId' => $chatId, 'error' => $error]);
+        jsonResponse(502, 'Failed to send WhatsApp message', ['error' => $error]);
         return;
     }
 
