@@ -2,6 +2,7 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/export.php';
 
 // --- CREATE ---
 function createCustomer($conn, $input, $username, $company_id){
@@ -187,6 +188,61 @@ function getDetailCustomer($conn, $customer_id, $company_id){
     ];
 
     jsonResponse(200, 'Customer found', $data);
+}
+
+// --- GET POLICIES OWNED BY CUSTOMER (v1.1) ---
+function getCustomerPolicies($conn, $customer_id, $company_id, $params){
+    if (!$customer_id) {
+        jsonResponse(400, 'customer_id is required');
+        return;
+    }
+
+    $customer_id = mysqli_real_escape_string($conn, $customer_id);
+
+    $check = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".customers WHERE customer_id = '$customer_id' AND company_id = '$company_id' LIMIT 1");
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Customer not found');
+        return;
+    }
+
+    $page   = max(1, (int)($params['page']  ?? 1));
+    $limit  = min(100, max(1, (int)($params['limit'] ?? 10)));
+    $offset = ($page - 1) * $limit;
+
+    $renewal_status = isset($params['renewal_status']) ? mysqli_real_escape_string($conn, $params['renewal_status']) : '';
+    $where = "p.customer_id = '$customer_id' AND p.company_id = '$company_id'";
+    if ($renewal_status && in_array($renewal_status, ['pending', 'renewed', 'lapsed', 'cancelled'], true)) {
+        $where .= " AND p.renewal_status = '$renewal_status'";
+    }
+
+    $query = "SELECT p.policy_id, p.policy_number, p.product_type, p.policy_year,
+                p.renewal_status, p.payment_status,
+                p.coverage_start, p.coverage_end,
+                p.sum_insured, p.premium_amount, p.commission_amount,
+                p.insurer_id, i.short_name AS insurer_short_name,
+                p.issuing_agent_id, p.created_at
+              FROM " . APP_SCHEMA . ".policies p
+              LEFT JOIN " . APP_SCHEMA . ".insurers i ON i.insurer_id = p.insurer_id
+              WHERE $where
+              ORDER BY p.coverage_start DESC
+              LIMIT $limit OFFSET $offset";
+
+    $countQuery = "SELECT COUNT(*) AS total FROM " . APP_SCHEMA . ".policies p WHERE $where";
+
+    $result      = mysqli_query($conn, $query);
+    $countResult = mysqli_query($conn, $countQuery);
+    $total       = $countResult ? (int)mysqli_fetch_assoc($countResult)['total'] : 0;
+    $data        = $result ? mysqli_fetch_all($result, MYSQLI_ASSOC) : [];
+
+    jsonResponse(200, 'Customer policies retrieved', [
+        'data' => $data,
+        'pagination' => [
+            'total'       => $total,
+            'page'        => $page,
+            'limit'       => $limit,
+            'total_pages' => $limit > 0 ? (int)ceil($total / $limit) : 0,
+        ]
+    ]);
 }
 
 // --- UPDATE PROFILE FIELDS ---
@@ -596,9 +652,9 @@ if (!$company_id) {
     exit;
 }
 
-// $parts[3] = customer_id or special keyword (e.g. 'import')
-// $parts[4] = sub-action (e.g. 'status', 'follow-ups')
-$customer_id = (!empty($action) && $action !== 'import') ? $action : null;
+// $parts[3] = customer_id or special keyword (e.g. 'import', 'export')
+// $parts[4] = sub-action (e.g. 'status', 'follow-ups', 'policies')
+$customer_id = (!empty($action) && !in_array($action, ['import', 'export'], true)) ? $action : null;
 $sub_action  = $parts[4] ?? '';
 
 try {
@@ -607,6 +663,11 @@ try {
     // POST /api/v1/customers/import
     if ($method === 'POST' && $action === 'import') {
         importCustomers($conn, $company_id, $username);
+
+    // GET /api/v1/customers/export
+    } elseif ($action === 'export') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        exportCustomers($conn, $company_id, $_GET);
 
     // PUT /api/v1/customers/{customer_id}/status
     } elseif ($customer_id && $sub_action === 'status') {
@@ -618,6 +679,11 @@ try {
     } elseif ($customer_id && $sub_action === 'follow-ups') {
         if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
         getFollowUps($conn, $customer_id, $company_id);
+
+    // GET /api/v1/customers/{customer_id}/policies
+    } elseif ($customer_id && $sub_action === 'policies') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        getCustomerPolicies($conn, $customer_id, $company_id, $_GET);
 
     // /api/v1/customers/{customer_id}
     } elseif ($customer_id) {

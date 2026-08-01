@@ -1,5 +1,218 @@
 # Agentra API Documentation
 
+---
+
+## ⚠️ What's New — v1.1.0 (FE Team: Action Required)
+
+> **SQL migrations required before deploying this version:**
+> - `migration_policy_renewal_fields.sql` — adds `policies.insured_name`, `policies.renewal_reminder_sent_at`
+> - `migration_renewal_notification_settings.sql` — adds `notification_settings.renewal_reminder_days`, `notification_settings.renewal_wa_message_template`, and extends `whatsapp_digest_logs.digest_type`
+>
+> Both are additive/nullable-default and safe to run on a live DB.
+
+### Product ask vs. what was built
+
+The v1.1.0 scope came from three feature requests. Quoted here alongside the assumptions made while turning each into an API, so PM/FE can flag anything that doesn't match intent before this ships.
+
+**1. Customer**
+> "If we open the customer detail, we can show up the policy that has been own by it customer" / "The export button in customer must be run in customer list, it must call API and export the customer in excel"
+- Built exactly as asked: [5.10 Get Customer Policies](#510-get-customer-policies) for the detail-page policy list, [5.11 Export Customers to Excel](#511-export-customers-to-excel) for the list-page export button.
+- No open questions here.
+
+**2. Renewal**
+> "If renewal reminder in 30 days, please send the list policy to the agent by whatsapp what must be followup"
+- Built as an internal digest **to the agent** (not the customer) — [`POST /services/renewal-reminder`](#services-renewal-reminder-cron), one message per agent listing all their policies entering the window, sent once per policy (tracked via `renewal_reminder_sent_at` so it doesn't repeat daily). 30 days is the *default*, made configurable per company (`renewal_reminder_days`) since that's a one-column cost for real flexibility.
+- **Assumption to validate:** nothing in this repo runs a daily cron today — I built the endpoint and a token-minting script, but *scheduling* the daily call (crontab / hosting scheduler / Cloud Scheduler) is outside this codebase and still needs to be set up.
+
+> "The agent must can set the default message for sending message while click whatsapp and the message can be set while click sending whatsapp"
+- Read this as a **separate, customer-facing** action from the digest above — the manual "Send WhatsApp" button on a renewal row. Built as [RN-003](#rn-003--send-renewal-whatsapp) with a saved default template (`renewal_wa_message_template`, editable via [3.4](#34-update-notification-settings)) that's still overridable per send.
+- **Assumption to validate:** the template is saved **per company**, not per individual agent — `notification_settings` has always been a one-row-per-company table (even though it has a `user_id` column), so a second sub-agent would see/use the same template the main agent set. Flag if sub-agents need their own independent templates — that would need a schema change (template moved to `agent_profiles`).
+
+> "If renewal, some of fields must be update like nomor polis, periode, rate, item pertanggungan, nama tertanggung (opsional). For the expired date if the customer are agree auto +365 days"
+- Built as [6.12 Renew Policy](#612-renew-policy): new `policy_number` required, `coverage_start`/`coverage_end` (periode), `commission_rate`/`commission_tax_rate` (rate), and coverages (item pertanggungan) are all carried forward from the source policy and overridable. `coverage_end` auto-computes as `coverage_start + 365 days` whenever it's left out of the request — that's the "customer agrees" default; passing it explicitly overrides it.
+- **New field:** `nama tertanggung` didn't map to any existing column, so `policies.insured_name` was added (optional, falls back to the customer's name) — confirm this is the right home for it rather than, say, a per-renewal note.
+
+**3. Revenue**
+> "We must generate report how much production in that month and week so the user can count the commission manually"
+- Built as [`GET /revenue/summary`](#revenue) — monthly totals plus a week-by-week breakdown (calendar Mon–Sun, clipped to the month) and a per-agent breakdown, all keyed off `coverage_start` (the same "production date" convention already used by the policy export's `month` filter).
+- **Assumption to validate:** "production" here means gross premium written (`premium_amount`), not commission received — the report shows both raw premium and computed commission side by side so it can be checked against whatever the insurer actually pays, but doesn't attempt to reconcile against `commissions.received_amount` itself. Say the word if you want received-vs-expected reconciliation folded into this report too.
+
+### 1. Customer — policies owned by a customer + Excel export
+
+- **New:** `GET /api/v1/customers/{customer_id}/policies` — paginated list of every policy owned by a customer (replaces relying on the 5-item `policies_summary.recent` preview on `GET /customers/{id}`). See [5.10](#510-get-customer-policies).
+- **New:** `GET /api/v1/customers/export` — downloads the customer list as `.xlsx`, same filters as `GET /customers`. See [5.11](#511-export-customers-to-excel).
+
+### 2. Renewal — renew action, insured name override, WhatsApp follow-up
+
+- **New:** `POST /api/v1/policies/{policy_id}/renew` — creates the next `policy_year` record from an expiring policy: new `policy_number`, periode, rate, and item pertanggungan (coverages) are all carried forward from the source policy and individually overridable. **If `coverage_end` is omitted, it auto-calculates as `coverage_start + 365 days`** — i.e. the "customer agrees to renew as-is" default. See [6.12](#612-renew-policy).
+- **New field `insured_name`** on policies — optional "nama tertanggung" override for policy documents, falls back to the customer's `display_name` when not set. Available on create/update/renew and returned on `GET /policies/{id}`.
+- **New:** `POST /api/v1/renewals/{policy_id}/send-whatsapp` — sends (and logs as a follow-up) a WhatsApp message to the customer about their upcoming renewal. Uses the company's saved default template unless a `message` override is passed in the request body. See [RN-003](#rn-003--send-renewal-whatsapp).
+- **New:** `GET /api/v1/users/me/notification-settings` — was previously write-only (`PUT` only); FE can now fetch current settings to prefill the settings form. See [3.4b](#34b-get-notification-settings).
+- **New settings fields** on `PUT /api/v1/users/me/notification-settings`: `renewal_reminder_days` (default 30) and `renewal_wa_message_template` (the agent-editable default WhatsApp message, supports `{customer_name} {policy_number} {product_type} {insurer_name} {coverage_end} {days_until_expiry}` placeholders). See [3.4](#34-update-notification-settings).
+- **New (system/cron):** `POST /api/v1/services/renewal-reminder` — sends each issuing agent a WhatsApp digest of their policies entering the renewal window. Intended to be called once daily by an external scheduler using a long-lived service token (see [`mint-cron-token.php`](#services-renewal-reminder-cron)); a logged-in user's normal token also works and scopes the run to their own company. See [Services](#services-renewal-reminder-cron).
+
+### 3. Revenue — production report by week/month
+
+- **New:** `GET /api/v1/revenue/summary?month=YYYY-MM` — monthly production totals (premium, commission, net commission), broken down by calendar week and by issuing agent, for manually reconciling commission against insurer statements. See [Revenue](#revenue).
+
+---
+
+## ⚠️ What's New — v1.4
+
+### Export Policies to Excel
+`
+New endpoint to download the policy list as a `.xlsx` file in the standard monthly reporting format (matches the existing **MEI 2026.xlsx** template):
+
+```
+GET /api/v1/policies/export
+```
+
+- Accepts the same filter params as `GET /api/v1/policies` plus a new `month` param (filters by `coverage_start` month and sets the filename).
+- Policies are grouped by issuing agent — a bold sub-header row is inserted before each agent group.
+- Returns a binary XLSX download. No JSON response.
+
+See [Section 6.11](#611-export-policies-to-excel) for full details.
+
+---
+
+## ⚠️ What's New — v1.3 (FE Team: Action Required)
+
+### 1. `biaya_polis` dan `diskon` — new optional cost/discount fields on policies
+
+Both fields are **optional integers (IDR), default 0**. They affect the customer invoice calculation.
+
+**Updated `customer_premium_amount` formula:**
+
+```
+customer_premium_amount = premium_amount + materai_amount + biaya_polis
+                          − commission_amount − diskon
+```
+
+**New fields on every policy response (`GET /policies`, `GET /policies/{id}`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `biaya_polis` | int (IDR) | Admin/policy fee charged on top of premium |
+| `diskon` | int (IDR) | Discount deducted from customer invoice |
+
+**New optional input fields on `POST /policies`, `PUT /policies/{id}`, and `PATCH /policies/{id}`:**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `biaya_polis` | int | No | Defaults to `0`. Must be ≥ 0 |
+| `diskon` | int | No | Defaults to `0`. Must be ≥ 0 |
+
+> **SQL migration required:** Run `migration_biaya_polis_diskon.sql` on the database before deploying this version. The migration is safe to run on a live DB — existing rows get `biaya_polis = 0` and `diskon = 0`.
+
+---
+
+### 2. ⚠️ FE Bug: "Update Without Endorsement" blocked after first use
+
+**Bug reported by user:** Cannot update a policy without endorsement (`PATCH /policies/{id}`) more than once.
+
+**Backend status: No restriction exists on the API side.** `PATCH /policies/{id}` (PO-006, `directUpdatePolicy`) can be called any number of times without limit. The bug is in the **frontend** — likely the PATCH button/action is being hidden or disabled after the first successful direct update. Please investigate the FE state management around this action.
+
+---
+
+## ⚠️ What's New — v1.2
+
+### Delete & Direct-Update Policy (no endorsement)
+
+Two new endpoints on `/api/v1/policies/{policy_id}`:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `PATCH` | `/api/v1/policies/{id}` | Update any policy field **without** creating an endorsement log. Use for correcting data entry mistakes. |
+| `DELETE` | `/api/v1/policies/{id}` | Permanently delete a policy and all related records (commission, coverages, co-assurance, follow-ups, audit logs). |
+
+> **`PUT` vs `PATCH`:** `PUT` records an endorsement when financial/date fields change. `PATCH` always logs as `policy_updated (koreksi)` regardless of which fields are changed.
+
+See [Section 6.4b](#64b-direct-update-policy-without-endorsement) and [Section 6.4c](#64c-delete-policy) for full details.
+
+---
+
+## ⚠️ What's New — v1.1 (FE Team: Action Required)
+
+The following changes are live and require frontend updates. All changes are **additive** (no existing fields were removed or renamed).
+
+### 1. Premium / Commission Breakdown (new fields on `policies` and `commissions`)
+
+The calculation formula is now:
+
+```
+commission_amount       = premium_amount × commission_rate / 100                          ← gross commission
+commission_tax_amount   = commission_amount × commission_tax_rate                         ← PPh withheld
+net_commission_amount   = commission_amount − commission_tax_amount                       ← what agent keeps
+customer_premium_amount = premium_amount + materai_amount + biaya_polis − commission_amount − diskon  ← invoice to customer
+```
+
+**New fields on every policy response:**
+
+| Field | Type | Description |
+|---|---|---|
+| `materai_amount` | int (IDR) | Stamp duty — entered per policy |
+| `commission_tax_rate` | decimal (0–1) | PPh rate e.g. `0.0250` = 2.5% |
+| `commission_tax_amount` | int (IDR) | Tax withheld from commission |
+| `net_commission_amount` | int (IDR) | Agent's net commission after tax |
+| `customer_premium_amount` | int (IDR) | Amount to bill the customer |
+| `is_coassurance` | 0/1 | Flag: show co-assurance badge |
+
+**New input fields on `POST /policies` and `PUT /policies/{id}`:**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `materai_amount` | int | No | Defaults to 0 |
+| `commission_tax_rate` | decimal 0–1 | No | Defaults to product's `default_tax_rate` |
+| `is_coassurance` | boolean | No | Set true only if adding co-insurers after creation |
+
+**New fields on every commission response (`/commissions`, `/commissions/{id}`, `/policies/{id}/commission`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `commission_tax_rate` | decimal | Snapshot of PPh rate at creation |
+| `commission_tax_amount` | int (IDR) | Tax amount withheld |
+| `net_expected_amount` | int (IDR) | Commission net of tax |
+
+### 2. Master Products — new `default_tax_rate` field
+
+`GET /master-products` and detail now return `default_tax_rate` (decimal 0–1).
+`POST /master-products` and `PUT /master-products/{id}` now accept `default_tax_rate`.
+This is the default PPh rate that auto-fills `commission_tax_rate` on a new policy.
+
+### 3. Co-assurance — new sub-resource
+
+New endpoints under `/api/v1/policies/{policy_id}/coassurance`.
+When `is_coassurance = 1` on a policy, fetch and display co-insurers from this sub-resource.
+See [Section 6.11](#611-co-assurance-participants) for full details.
+
+### 4. Building Construction Class (fire insurance)
+
+New optional field `construction_class` on `policies`. Only relevant for fire (and PAR/PSAKI) product types; set `null` for all other products.
+
+| Value | Kelas | Description |
+|---|---|---|
+| `"I"` | Kelas I | Hard construction — beton bertulang, bata, rangka besi/baja |
+| `"II"` | Kelas II | Semi-hard construction — campuran beton & kayu |
+| `"III"` | Kelas III | Light construction — kayu, atap seng/genteng |
+| `null` | — | Not applicable (car, motorcycle, travel, etc.) |
+
+**This is a policy-level field, not per coverage item.** All coverage items (Building FLEXAS, RSMD, OTHERS, Contents) under the same policy share the same construction class because they are at the same risk location.
+
+FE: Show a `<select>` (Kelas I / II / III) on the policy form, **only when `product_type` is a fire/property product**. Send `null` or omit for non-fire products. The GET detail response always includes `construction_class` (null when not set).
+
+### 5. Recommended Postman testing order (additions)
+
+```
+15. Add Co-insurer        → POST   /policies/{id}/coassurance
+16. List Co-insurers      → GET    /policies/{id}/coassurance
+17. Update Co-insurer     → PUT    /policies/{id}/coassurance/{ca_id}
+18. Remove Co-insurer     → DELETE /policies/{id}/coassurance/{ca_id}
+19. Correct Policy (no endorsement) → PATCH  /policies/{id}
+20. Delete Policy         → DELETE /policies/{id}
+```
+
+---
+
 ## Overview
 
 - **Base URL:** `http://localhost/agentra_api`
@@ -22,21 +235,24 @@
 Follow this sequence to avoid dependency errors:
 
 ```
-1.  Register          → POST  /auth/register
-2.  Login             → POST  /auth/login                   ← save access_token + refresh_token
-3.  Get Plans         → GET   /plans?app_id=...             (no auth needed)
-4.  Create Insurer    → POST  /insurers
-5.  Create Customer   → POST  /customers
-6.  Create Policy     → POST  /policies                     ← auto-creates commission record
-7.  Add Coverages     → POST  /policies/{id}/coverages      ← optional, syncs premium & commission
-8.  Follow-up         → POST  /policies/{id}/follow-ups
-9.  Update Statuses   → PATCH /policies/{id}/payment-status
-                        PATCH /policies/{id}/renewal-status
-10. View Commission   → GET   /policies/{id}/commission     ← agent sees expected commission
-11. View History      → GET   /policies/{id}/logs           ← full event timeline
-12. Commission List   → GET   /commissions                  ← all commission records
-13. Commission Stats  → GET   /commissions/summary          ← pending/received/discrepancy totals
-14. Mark Received     → PATCH /commissions/{id}/mark-received ← record actual payment from insurer
+1.  Register          → POST   /auth/register
+2.  Login             → POST   /auth/login                   ← save access_token + refresh_token
+3.  Get Plans         → GET    /plans?app_id=...             (no auth needed)
+4.  Create Insurer    → POST   /insurers
+5.  Create Customer   → POST   /customers
+6.  Create Policy     → POST   /policies                     ← auto-creates commission record
+7.  Add Coverages     → POST   /policies/{id}/coverages      ← optional, syncs premium & commission
+8.  Follow-up         → POST   /policies/{id}/follow-ups
+9.  Update Statuses   → PATCH  /policies/{id}/payment-status
+                        PATCH  /policies/{id}/renewal-status
+10. View Commission   → GET    /policies/{id}/commission     ← agent sees expected commission
+11. View History      → GET    /policies/{id}/logs           ← full event timeline
+12. Commission List   → GET    /commissions                  ← all commission records
+13. Commission Stats  → GET    /commissions/summary          ← pending/received/discrepancy totals
+14. Mark Received     → PATCH  /commissions/{id}/mark-received ← record actual payment from insurer
+15. Correct Policy    → PATCH  /policies/{id}               ← update without endorsement log
+16. Delete Policy     → DELETE /policies/{id}               ← irreversible, removes all related data
+17. Export to Excel   → GET    /policies/export?month=YYYY-MM ← download .xlsx report
 ```
 
 > **Tip:** Set a Postman environment variable `{{access_token}}` after login, then use `Authorization: Bearer {{access_token}}` on all protected endpoints.
@@ -373,6 +589,42 @@ Auth required.
 | monthly_digest_enabled | boolean | No | Enable monthly digest |
 | monthly_digest_day | integer | No | Day of month, 1–28 |
 | monthly_digest_time | string | No | HH:MM format |
+| `renewal_reminder_days` | integer | No | **[NEW v1.1]** Days before `coverage_end` to trigger the automatic renewal WA reminder. 1–90, default 30 |
+| `renewal_wa_message_template` | string | No | **[NEW v1.1]** Default message for the manual "Send WhatsApp" renewal action. Placeholders: `{customer_name}` `{policy_number}` `{product_type}` `{insurer_name}` `{coverage_end}` `{days_until_expiry}`. Pass an empty string to clear it and fall back to the built-in default. |
+
+---
+
+### 3.4b Get Notification Settings
+
+**GET** `/api/v1/users/me/notification-settings`
+
+Auth required. **[NEW v1.1]** — previously this resource was write-only.
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Notification settings retrieved",
+  "data": {
+    "setting_id": "notif_abc123",
+    "company_id": "comp_001",
+    "user_id": "usr_001",
+    "daily_digest_enabled": true,
+    "daily_digest_time": "08:00:00",
+    "daily_days_of_week": "1,2,3,4,5,6",
+    "monthly_digest_enabled": true,
+    "monthly_digest_day": 1,
+    "monthly_digest_time": "08:00:00",
+    "whatsapp_target_number": "628123456789",
+    "renewal_reminder_days": 30,
+    "renewal_wa_message_template": null,
+    "updated_by": "usr_001",
+    "updated_at": "2026-08-01 09:00:00"
+  }
+}
+```
+
+**Response `404`** — settings have never been saved for this company yet (call `PUT` first).
 
 ---
 
@@ -682,6 +934,73 @@ Auth required.
 
 ---
 
+### 5.10 Get Customer Policies
+
+**GET** `/api/v1/customers/{customer_id}/policies`
+
+Auth required. **[NEW v1.1]** Paginated list of every policy owned by this customer — use this instead of the 5-item preview in `policies_summary` on `GET /customers/{id}` when rendering a full "Policies" tab on the customer detail page.
+
+**Query Parameters:**
+| Param | Default | Max |
+|---|---|---|
+| page | 1 | — |
+| limit | 10 | 100 |
+| renewal_status | — | `pending`, `renewed`, `lapsed`, `cancelled` |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Customer policies retrieved",
+  "data": {
+    "data": [
+      {
+        "policy_id": "pol_abc123",
+        "policy_number": "01.08.2026.001",
+        "product_type": "fire",
+        "policy_year": 1,
+        "renewal_status": "pending",
+        "payment_status": "unpaid",
+        "coverage_start": "2026-08-01",
+        "coverage_end": "2027-08-01",
+        "sum_insured": 500000000,
+        "premium_amount": 2000000,
+        "commission_amount": 300000,
+        "insurer_id": "ins_001",
+        "insurer_short_name": "CHUBB",
+        "issuing_agent_id": null,
+        "created_at": "2026-08-01 09:00:00"
+      }
+    ],
+    "pagination": { "total": 1, "page": 1, "limit": 10, "total_pages": 1 }
+  }
+}
+```
+
+---
+
+### 5.11 Export Customers to Excel
+
+**GET** `/api/v1/customers/export`
+
+Auth required. **[NEW v1.1]** Downloads the customer list as a `.xlsx` file. Accepts the same filters as `GET /api/v1/customers`.
+
+**Query Parameters:**
+| Param | Description |
+|---|---|
+| `params` | Search by name / legal name / NIK / NPWP |
+| `customer_type` | `individual` or `company` |
+| `status` | `active`, `inactive`, `lapsed` |
+
+**Response:**
+- **Content-Type:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- **Content-Disposition:** `attachment; filename="DAFTAR CUSTOMER.xlsx"`
+- **Body:** Binary XLSX file — columns: NO, NAMA, TIPE, NIK/NPWP, HP, WHATSAPP, EMAIL, PIC, STATUS, SUMBER, TANGGAL DIBUAT
+
+**Response `404`** — no customers match the given filters.
+
+---
+
 ## 6. Policies
 
 ### 6.1 List Policies
@@ -722,7 +1041,11 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
   "coverage_end": "2026-06-01",
   "sum_insured": 300000000,
   "premium_amount": 4500000,
-  "commission_rate": 10.5,
+  "materai_amount": 10000,
+  "biaya_polis": 50000,
+  "diskon": 0,
+  "commission_rate": 15,
+  "commission_tax_rate": 0.025,
   "policy_year": 1,
   "issuing_agent_id": null,
   "previous_policy_id": null,
@@ -737,17 +1060,41 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
 | insurer_id | string | Yes | From `/insurers` |
 | customer_id | string | Yes | From `/customers` |
 | policy_number | string | Yes | Unique per company |
-| product_type | string | Yes | `fire`, `motorcycle`, `car`, `travel`, `cargo`, `other`, `kecelakaan`, `aep` |
+| product_type | string | Yes | Must match an active `product_code` in master products |
 | coverage_start | string | Yes | YYYY-MM-DD |
 | coverage_end | string | Yes | YYYY-MM-DD |
 | sum_insured | integer | Yes | Coverage amount (IDR) |
-| premium_amount | integer | Yes | Premium (IDR) |
-| commission_rate | float | **No** | Commission %. If omitted, auto-resolved from policy number prefix and product type (see [Commission Auto-Resolution](#commission-auto-resolution)). Required only if no rule matches. |
+| premium_amount | integer | Yes | Gross premium from insurer (IDR) |
+| materai_amount | integer | No | Stamp duty in IDR. Default: `0`. Varies per policy. |
+| biaya_polis | integer | **No** ⭐ NEW | Admin/policy fee in IDR. Default: `0`. Added to customer invoice. |
+| diskon | integer | **No** ⭐ NEW | Discount in IDR. Default: `0`. Deducted from customer invoice. |
+| commission_rate | float | No | Commission % (0–100). If omitted, auto-resolved from product type or policy number prefix. Required only if no rule matches. |
+| commission_tax_rate | decimal | No | PPh rate as decimal 0–1 (e.g. `0.025` = 2.5%). Default: inherited from `master_products.default_tax_rate`. |
 | policy_year | integer | No | Default: 1 |
 | object_insured | string | No | Description of insured object |
+| `insured_name` | string | No | **[NEW v1.1]** Optional "nama tertanggung" override for policy documents. Falls back to the customer's `display_name` when omitted. |
 | coverage_notes | string | No | Coverage details |
+| construction_class | string | No | Fire insurance only: `"I"`, `"II"`, or `"III"`. Omit or send `null` for non-fire products. |
 | notes | string | No | Internal notes |
 | previous_policy_id | string | No | For renewals |
+
+> ⭐ **FE note:** Show `materai_amount`, `biaya_polis`, and `diskon` as optional inputs on the policy form (default 0). The `commission_tax_rate` field can be shown as an editable field pre-filled from the master product. Do NOT ask for `commission_tax_amount`, `net_commission_amount`, or `customer_premium_amount` as inputs — those are calculated server-side.
+
+**How commission and customer invoice are calculated server-side:**
+```
+commission_amount       = premium_amount × commission_rate / 100
+commission_tax_amount   = commission_amount × commission_tax_rate
+net_commission_amount   = commission_amount − commission_tax_amount
+customer_premium_amount = premium_amount + materai_amount + biaya_polis − commission_amount − diskon
+```
+
+**Example with premium=5,000,000, rate=15%, tax=2.5%, materai=10,000, biaya_polis=50,000, diskon=100,000:**
+```
+commission_amount       = 5,000,000 × 15% = 750,000
+commission_tax_amount   = 750,000 × 0.025 = 18,750
+net_commission_amount   = 750,000 − 18,750 = 731,250
+customer_premium_amount = 5,000,000 + 10,000 + 50,000 − 750,000 − 100,000 = 4,210,000
+```
 
 **Response `201`:**
 ```json
@@ -779,22 +1126,99 @@ Auth required. Returns full details including customer and insurer info.
 
 ---
 
-### 6.4 Update Policy
+### 6.4 Update Policy (with Endorsement)
 
 **PUT** `/api/v1/policies/{policy_id}`
 
-Auth required. Commission is auto-recalculated if `premium_amount` or `commission_rate` changes.
+Auth required. Commission breakdown is auto-recalculated whenever any financial field changes (`premium_amount`, `commission_rate`, `commission_tax_rate`, `materai_amount`, `biaya_polis`, `diskon`). Changes to financial or date fields are recorded as an **endorsement** in the policy audit log.
 
 **Request Body (any updatable fields):**
 ```json
 {
   "sum_insured": 350000000,
   "premium_amount": 5000000,
-  "commission_rate": 11.0,
+  "materai_amount": 10000,
+  "biaya_polis": 50000,
+  "diskon": 100000,
+  "commission_rate": 15.0,
+  "commission_tax_rate": 0.025,
   "object_insured": "Toyota Avanza 2021 - B 1234 XYZ",
   "coverage_notes": "Comprehensive + flood + earthquake",
+  "construction_class": "I",
   "notes": "Updated after endorsement"
 }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `object_insured` | string | Insured object description |
+| `insured_name` | string\|null | **[NEW v1.1]** "Nama tertanggung" override, or `null` if using the customer's `display_name` |
+| `sum_insured` | int | New TSI in IDR |
+| `coverage_notes` | string | Coverage clause notes |
+| `construction_class` | string\|null | `"I"`, `"II"`, `"III"`, or `null` to clear |
+| `coverage_start` | string | YYYY-MM-DD |
+| `coverage_end` | string | YYYY-MM-DD |
+| `premium_amount` | int | Gross premium |
+| `materai_amount` | int | Stamp duty |
+| `biaya_polis` | int | ⭐ NEW — Admin/policy fee in IDR |
+| `diskon` | int | ⭐ NEW — Discount in IDR |
+| `commission_rate` | float | Commission % |
+| `commission_tax_rate` | decimal | PPh rate 0–1 |
+| `notes` | string | Internal notes |
+
+> ⭐ **FE note:** All financial fields (`premium_amount`, `materai_amount`, `biaya_polis`, `diskon`, `commission_rate`, `commission_tax_rate`) can be updated independently — the server recalculates `customer_premium_amount` on any change.
+
+**Response `200`:**
+```json
+{ "status_message": "Policy updated successfully" }
+```
+
+---
+
+### 6.4b Direct Update Policy (without Endorsement)
+
+**PATCH** `/api/v1/policies/{policy_id}`
+
+Auth required. Updates policy fields **without** creating an endorsement entry in the audit log. Use this to correct data entry mistakes. Accepts the same fields as `PUT`. Commission breakdown is still recalculated and synced when financial fields are provided.
+
+> **When to use PATCH vs PUT:**
+> - Use `PUT` for formal policy changes (mid-term changes, agreed amendments) — creates an endorsement log.
+> - Use `PATCH` for correcting input errors (typos, wrong values entered at creation) — logs as `policy_updated` (koreksi), never as `endorsement`.
+
+**Request Body (any updatable fields — same as PUT, including `biaya_polis` and `diskon`):**
+```json
+{
+  "premium_amount": 4500000,
+  "biaya_polis": 50000,
+  "diskon": 0,
+  "commission_rate": 15.0,
+  "object_insured": "Toyota Avanza 2020 - B 1234 XYZ"
+}
+```
+
+**Response `200`:**
+```json
+{ "status_message": "Policy updated successfully" }
+```
+
+---
+
+### 6.4c Delete Policy
+
+**DELETE** `/api/v1/policies/{policy_id}`
+
+Auth required. Permanently deletes the policy and all associated records (commission, coverages, co-assurance participants, follow-up logs, and audit logs). **This action is irreversible.**
+
+> Use this only to remove incorrectly created policies. For policies that are cancelled or lapsed, use `PATCH /policies/{id}/renewal-status` with `"renewal_status": "cancelled"` instead.
+
+**Response `200`:**
+```json
+{ "status_message": "Policy deleted successfully" }
+```
+
+**Response `404`:**
+```json
+{ "status_message": "Policy not found" }
 ```
 
 ---
@@ -954,13 +1378,18 @@ Auth required. Returns the commission record for this policy so the agent can se
 | `commission_type` | `direct` = agent's own policy; `override` = from sub-agent policy |
 | `premium_amount` | Snapshot of policy premium at last sync (IDR) |
 | `commission_rate` | Rate % at last sync |
-| `expected_amount` | `premium_amount × commission_rate / 100` (IDR) |
+| `expected_amount` | Gross commission = `premium_amount × commission_rate / 100` (IDR) |
+| `commission_tax_rate` | ⭐ NEW — PPh rate snapshot (decimal 0–1) |
+| `commission_tax_amount` | ⭐ NEW — Tax withheld = `expected_amount × commission_tax_rate` (IDR) |
+| `net_expected_amount` | ⭐ NEW — Agent nets this = `expected_amount − commission_tax_amount` (IDR) |
 | `received_amount` | Amount actually received from insurer (IDR). `0` until marked received |
 | `status` | `pending` → `received` or `discrepancy` (when received ≠ expected). `cancelled` if policy voided |
 | `expected_date` | Date agent expects insurer to pay (set manually) |
 | `received_date` | Date insurer actually paid |
 | `reference_number` | Insurer's payment reference number |
 | `discrepancy_notes` | Notes explaining the discrepancy |
+
+> ⭐ **FE note:** Display the commission breakdown as a 3-line card: **Gross** (`expected_amount`) → **Tax / PPh** (`commission_tax_amount`) → **Net** (`net_expected_amount`). The `received_amount` from the insurer should be compared against `net_expected_amount` in the UI (net of tax is what actually arrives).
 
 **`status` lifecycle:**
 
@@ -1116,6 +1545,154 @@ Auth required. Returns the full chronological event history for a policy — cre
 
 ---
 
+### 6.11 Export Policies to Excel
+
+**GET** `/api/v1/policies/export`
+
+Auth required. Downloads the policy list as a `.xlsx` file in the standard monthly reporting format. Policies are grouped by issuing agent with a bold sub-header row before each agent group, matching the existing manual template.
+
+**Query Parameters:**
+
+| Param | Description |
+|---|---|
+| `month` | `YYYY-MM` — filter by `coverage_start` month. Determines the filename (e.g. `MEI 2026.xlsx`). Primary param for the monthly export. |
+| `expiry_month` | `YYYY-MM` — filter by `coverage_end` month |
+| `search` | Search by policy number or customer name |
+| `customer_id` | Filter by customer |
+| `product_type` | Filter by product type |
+| `insurer_id` | Filter by insurer |
+| `renewal_status` | `pending`, `renewed`, `lapsed`, `cancelled` |
+| `agent_id` | Filter by issuing agent |
+
+> If neither `month` nor `expiry_month` is provided, all company policies matching the other filters are exported and the filename defaults to `DAFTAR POLIS.xlsx`.
+
+**Response:**
+
+- **Content-Type:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- **Content-Disposition:** `attachment; filename="MEI 2026.xlsx"` (derived from `month` param)
+- **Body:** Binary XLSX file
+
+**Excel structure:**
+
+| Row | Content |
+|---|---|
+| 1 | Title — e.g. `MEI 2026` (bold, column B) |
+| 2 | Column headers (bold) |
+| 3+ | Agent sub-header row (bold) followed by that agent's policy rows. Repeats for each agent. |
+
+**Column layout:**
+
+| Col | Header | Source field |
+|---|---|---|
+| A | NO POLIS LAMA | Previous policy's `policy_number` — or `BARU` for new policies with no prior |
+| B | NO POLIS | `policies.policy_number` |
+| C | *(blank)* | `commission_rate / 100` (e.g. `0.15` for 15%) |
+| D | *(blank)* | `commission_tax_rate` (e.g. `0.025`) |
+| E | AGEN | `customers.display_name` (tertanggung) |
+| F | EMAIL | Customer email (`personal_email` → `company_email` → `pic_email`) |
+| G | HP | Customer phone (`personal_phone` → `company_phone` → `pic_phone`) |
+| H | LOKASI PERTANGGUNGAN | `policies.object_insured` |
+| I | DATE | Day of month from `coverage_start` |
+| J | BANGUNAN | TSI text for `bangunan` coverage (e.g. `500 JT`) |
+| K | STOK 1 | TSI text for 1st `stok` coverage |
+| L | STOK 2 | TSI text for 2nd `stok` coverage (if multiple stok entries) |
+| M | INVEN/ISI | TSI text for `invenisi` coverage |
+| N | MESIN | TSI text for `mesin` coverage |
+| O | DLL | TSI text for `dll` coverage |
+| P | RATE | Per-mille rates from `policy_coverages.rate_permille`, joined with `+` (comma as decimal separator, e.g. `0,443+0,1+0,1`) |
+| Q | PREMI NETT | `premium_amount` |
+| R | PREMI | `premium_amount + biaya_polis + materai_amount` |
+| S | KOMISI | `commission_amount` |
+| T | PAJAK | `commission_tax_amount` |
+| U | KOMISI NETT | `net_commission_amount` |
+| V | PREMI YG HRS DISETOR | `customer_premium_amount` |
+
+> **TSI text format:** Values are shown as Indonesian short notation — e.g. `500 JT` (Juta / million) or `1,2 M` (Milyar / billion). If the coverage has a `coverage_label`, it is prepended: `label=500 JT`.
+
+**Example request (Postman):**
+
+```
+GET {{base_url}}/api/v1/policies/export?month=2026-05
+Authorization: Bearer {{access_token}}
+```
+
+Set the response **Save to file** in Postman to download the XLSX.
+
+**Response `404` (no matching policies):**
+```json
+{
+  "status_code": 404,
+  "status_message": "No policies found for export",
+  "data": []
+}
+```
+
+---
+
+### 6.12 Renew Policy
+
+**POST** `/api/v1/policies/{policy_id}/renew`
+
+Auth required. **[NEW v1.1]** Creates the next `policy_year` record from an expiring (source) policy — the standard "renewal" action. `customer_id`, `insurer_id`, `product_type`, and `issuing_agent_id` are always copied from the source policy. Everything else is copied forward too, but individually overridable.
+
+**Item pertanggungan (coverages):** if the source policy has `policy_coverages` rows, they are copied onto the new policy and `sum_insured` / `premium_amount` / the full commission breakdown are re-derived from the copy (matching how `POST/PUT/DELETE /policies/{id}/coverages` already keeps totals in sync). If the source policy has no coverage rows, the new policy's `sum_insured` / `premium_amount` fall back to the source's scalar values (overridable via the request body).
+
+**Request Body:**
+```json
+{
+  "policy_number": "01.08.2027.001",
+  "coverage_start": "2027-08-01",
+  "coverage_end": "2028-08-01",
+  "commission_rate": 15,
+  "commission_tax_rate": 0.025,
+  "insured_name": "PT Contoh Sejahtera",
+  "materai_amount": 10000,
+  "biaya_polis": 50000,
+  "diskon": 0,
+  "sum_insured": 500000000,
+  "premium_amount": 2000000,
+  "object_insured": "Gudang, Jl. Industri No. 5",
+  "coverage_notes": null,
+  "construction_class": "I",
+  "notes": null
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `policy_number` | string | **Yes** | New policy number for the renewed period. Must be unique per company. |
+| `coverage_start` | date | No | Defaults to the source policy's `coverage_end + 1 day` (contiguous renewal). |
+| `coverage_end` | date | No | **Auto = `coverage_start + 365 days` when omitted** — the "customer agrees to renew as-is" default. Provide explicitly for a non-standard period. |
+| `commission_rate` | decimal | No | Defaults to the source policy's rate. |
+| `commission_tax_rate` | decimal | No | Defaults to the source policy's tax rate (0–1, e.g. `0.025` = 2.5%). |
+| `insured_name` | string | No | "Nama tertanggung" override. Defaults to the source policy's `insured_name` (or empty string to clear it). |
+| `sum_insured` / `premium_amount` | integer | No | Only used when the source policy has no `policy_coverages` rows — ignored (recomputed) otherwise. Defaults to source's values. |
+| `materai_amount` / `biaya_polis` / `diskon` | integer | No | Default to the source policy's values. |
+| `object_insured` / `coverage_notes` / `construction_class` / `notes` | string | No | Default to the source policy's values. |
+
+**Behavior:**
+- The **source** policy is marked `renewal_status = "renewed"` and logged (`renewal_status_changed`).
+- The **new** policy is created with `renewal_status = "pending"`, `payment_status = "unpaid"`, `policy_year = source.policy_year + 1`, `previous_policy_id = source.policy_id`, and logged (`policy_created`).
+- A new `commissions` record is auto-created for the new policy, same as `POST /policies`.
+- Returns `409` if the source policy is already `renewed` or `cancelled`, or if the new `policy_number` already exists for the company.
+
+**Response `201`:**
+```json
+{
+  "status_code": 201,
+  "status_message": "Policy renewed successfully",
+  "data": {
+    "policy_id": "pol_def456",
+    "policy_number": "01.08.2027.001",
+    "previous_policy_id": "pol_abc123",
+    "coverage_start": "2027-08-01",
+    "coverage_end": "2028-08-01"
+  }
+}
+```
+
+---
+
 ## 7. Master Products
 
 Manages the product catalog and their default commission rates. `product_code` is what gets stored in `policies.product_type`.
@@ -1171,10 +1748,11 @@ All endpoints require `Authorization: Bearer <access_token>`.
 **Request Body:**
 ```json
 {
-  "product_code":    "kebakaran",
-  "product_name":    "Kebakaran",
-  "commission_rate": 15,
-  "policy_prefixes": "01,08,88,61,62"
+  "product_code":     "kebakaran",
+  "product_name":     "Kebakaran",
+  "commission_rate":  15,
+  "default_tax_rate": 0.025,
+  "policy_prefixes":  "01,08,88,61,62"
 }
 ```
 
@@ -1183,7 +1761,10 @@ All endpoints require `Authorization: Bearer <access_token>`.
 | `product_code` | string | Yes | Unique code per company (stored as `product_type` on policies). Lowercase. |
 | `product_name` | string | Yes | Human-readable name |
 | `commission_rate` | float | Yes | Default commission % (0–100) |
+| `default_tax_rate` | decimal | **No** ⭐ NEW | Default PPh rate as decimal 0–1 (e.g. `0.025` = 2.5%). Default: `0.025`. Auto-fills `commission_tax_rate` on new policies. |
 | `policy_prefixes` | string | No | Comma-separated policy number prefixes for auto-detection (e.g. `01,08,88,61,62`) |
+
+> ⭐ **FE note:** Show `default_tax_rate` as an editable field on the master product form (displayed as a percentage, e.g. convert `0.025` ↔ `2.5%`). When a product's tax rate is updated here, new policies auto-inherit it — existing policies are not retroactively changed.
 
 **Response `201`:**
 ```json
@@ -1209,6 +1790,7 @@ All fields optional. Send only what changes.
 | `product_code` | string | Must remain unique within company |
 | `product_name` | string | Display name |
 | `commission_rate` | float | New default commission % |
+| `default_tax_rate` | decimal | ⭐ NEW — New default PPh rate (0–1). Only affects future policies. |
 | `policy_prefixes` | string | Send empty string `""` to clear prefixes |
 | `is_active` | boolean | `false` deactivates the product |
 
@@ -1237,6 +1819,147 @@ If neither matches, the request returns `400`. Pass `commission_rate` explicitly
 | `kendaraan` | Kendaraan Bermotor | 25% | `02` |
 | `aep` | Tanggung Gugat Pihak Ketiga | 30% | — |
 | `kecelakaan` | Kecelakaan Diri | 20% | — |
+
+---
+
+---
+
+## 6.11 Co-assurance Participants
+
+> ⭐ **NEW in v1.1**
+
+When a policy has `is_coassurance = 1`, one or more other insurers share the risk. This sub-resource manages those participants.
+
+**Base path:** `/api/v1/policies/{policy_id}/coassurance`
+
+All endpoints require auth. The `{policy_id}` must belong to the authenticated company.
+
+---
+
+### CA-001 — List Co-assurance Participants
+
+**GET** `/api/v1/policies/{policy_id}/coassurance`
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Co-assurance participants found",
+  "data": {
+    "data": [
+      {
+        "coassurance_id":     "ca_xxx",
+        "policy_id":          "pol_xxx",
+        "co_insurer_id":      "ins_yyy",
+        "co_insurer_name":    "PT Asuransi Wahana Tata",
+        "co_insurer_short_name": "WAHANA",
+        "is_leader":          1,
+        "share_percent":      "60.00",
+        "sum_insured_share":  300000000,
+        "premium_share":      3000000,
+        "commission_rate":    "15.00",
+        "commission_amount":  450000,
+        "notes":              null,
+        "created_by":         "usr_xxx",
+        "created_at":         "2026-06-17 09:00:00",
+        "updated_at":         "2026-06-17 09:00:00"
+      },
+      {
+        "coassurance_id":     "ca_yyy",
+        "co_insurer_id":      null,
+        "co_insurer_name":    "PT Asuransi Raya",
+        "co_insurer_short_name": null,
+        "is_leader":          0,
+        "share_percent":      "40.00",
+        "sum_insured_share":  200000000,
+        "premium_share":      2000000,
+        "commission_rate":    "15.00",
+        "commission_amount":  300000,
+        "notes":              null
+      }
+    ]
+  }
+}
+```
+
+> ⭐ **FE note:** Rows are sorted: leader first, then by `share_percent` descending. Check `is_leader` to display the leader badge. The sum of `share_percent` across all rows should equal 100 — validate this in the UI before saving.
+
+---
+
+### CA-002 — Add Co-assurance Participant
+
+**POST** `/api/v1/policies/{policy_id}/coassurance`
+
+Automatically sets `policies.is_coassurance = 1` on the parent policy.
+
+**Request Body:**
+```json
+{
+  "co_insurer_name":   "PT Asuransi Wahana Tata",
+  "co_insurer_id":     "ins_yyy",
+  "is_leader":         true,
+  "share_percent":     60,
+  "sum_insured_share": 300000000,
+  "premium_share":     3000000,
+  "commission_rate":   15,
+  "notes":             null
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `co_insurer_name` | string | **Yes** | Always required — name of the co-insurer |
+| `co_insurer_id` | string | No | FK to `/insurers` if the co-insurer is in your system. Null for external insurers. |
+| `is_leader` | boolean | No | `true` = this insurer leads. Default: `false` |
+| `share_percent` | float | **Yes** | Their % share of the risk (0.01–100) |
+| `sum_insured_share` | int | No | Their portion of total UP (IDR) |
+| `premium_share` | int | No | Their portion of premium (IDR) |
+| `commission_rate` | float | No | Commission % on their share. Default: 0 |
+| `notes` | string | No | Free-text notes |
+
+**Response `201`:**
+```json
+{ "data": { "coassurance_id": "ca_xxx" } }
+```
+
+---
+
+### CA-003 — Update Co-assurance Participant
+
+**PUT** `/api/v1/policies/{policy_id}/coassurance/{coassurance_id}`
+
+All fields optional. Send only what changes.
+
+| Field | Type | Description |
+|---|---|---|
+| `co_insurer_name` | string | Updated name |
+| `co_insurer_id` | string or null | Link/unlink to insurer in system |
+| `is_leader` | boolean | Change leader flag |
+| `share_percent` | float | New share % |
+| `sum_insured_share` | int | New UP portion |
+| `premium_share` | int | New premium portion — `commission_amount` is recalculated automatically |
+| `commission_rate` | float | New commission rate |
+| `notes` | string | Updated notes (send `""` to clear) |
+
+**Response `200`:** `{ "status_message": "Co-assurance participant updated" }`
+
+---
+
+### CA-004 — Remove Co-assurance Participant
+
+**DELETE** `/api/v1/policies/{policy_id}/coassurance/{coassurance_id}`
+
+Removes the participant. If it was the **last** participant, automatically sets `policies.is_coassurance = 0`.
+
+**Response `200`:** `{ "status_message": "Co-assurance participant removed" }`
+
+---
+
+> ⭐ **FE implementation notes for co-assurance:**
+> 1. On the **policy form**, add a toggle "Ini polis ko-asuransi". When toggled on, show a multi-row table to enter co-insurer shares. Each row = one `POST /coassurance` call after the policy is created.
+> 2. On the **policy detail page**, if `is_coassurance = 1`, show a "Ko-Asuransi" card that fetches `GET /policies/{id}/coassurance` and renders the share table.
+> 3. Validate that `sum(share_percent)` = 100 client-side before submitting rows.
+> 4. `co_insurer_id` should be a searchable dropdown from `GET /insurers`. If the insurer is not in the system, leave it null and just fill `co_insurer_name`.
 
 ---
 
@@ -1395,6 +2118,47 @@ Returns aggregated renewal stats for the StatusPerpanjangan component.
 | `breakdown.lapsed` | Policies that lapsed without renewal |
 
 > **Note:** `total_omzet_potential` serves as the omzet target proxy derived from the actual book of business. A separate company target-setting endpoint can be added later to override this with a manual target.
+
+---
+
+### RN-003 — Send Renewal WhatsApp
+
+**POST** `/api/v1/renewals/{policy_id}/send-whatsapp`
+
+Auth required. **[NEW v1.1]** Sends a WhatsApp message to the customer about their upcoming renewal (the manual "Send WhatsApp" button on the renewal list). Uses the company's saved `renewal_wa_message_template` (see [3.4](#34-update-notification-settings)) unless `message` is provided, in which case that value is used for this send only — the saved default is untouched. Either way, the final text is run through placeholder substitution before sending.
+
+**Request Body:**
+```json
+{
+  "message": "Halo {customer_name}, polis Anda {policy_number} akan berakhir {days_until_expiry} hari lagi. Konfirmasi perpanjangan ya!"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `message` | string | No | Per-send override. Omit to use the saved company default template (or the built-in default if none is saved). |
+
+**Placeholders** (available in both the saved template and the per-send override): `{customer_name}` `{policy_number}` `{product_type}` `{insurer_name}` `{coverage_end}` `{days_until_expiry}`
+
+**Behavior:**
+- Resolves the customer's WhatsApp number (`personal_whatsapp` for individuals, `pic_whatsapp` for companies) — `400` if none on file.
+- Sends via the same WAHA integration used elsewhere in the app.
+- Logs a `follow_up_logs` entry (`channel = "whatsapp"`, `followup_status = "contacted"`) and a `policy_logs` entry, so the send shows up on the policy's follow-up timeline like a manual entry.
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "WhatsApp message sent",
+  "data": {
+    "message": "Halo Budi Santoso, polis Anda 01.08.2026.001 akan berakhir 12 hari lagi. Konfirmasi perpanjangan ya!",
+    "followup_id": "fu_xyz789"
+  }
+}
+```
+
+**Response `400`** — customer has no WhatsApp number on file, or the number is invalid.
+**Response `502`** — the WAHA send itself failed (network/session error); no follow-up log is written in this case.
 
 ---
 
@@ -1733,3 +2497,132 @@ Records the actual received amount from the insurer. Automatically sets status t
 ```
 
 > This action also writes an entry to `policy_logs` with event type `commission_marked_received` or `commission_discrepancy`, visible in `GET /api/v1/policies/{id}/logs`.
+
+---
+
+## Revenue
+
+**[NEW v1.1]** Production report for reconciling commission manually against insurer statements.
+
+### RV-001 — Revenue Summary
+
+**GET** `/api/v1/revenue/summary`
+
+Auth required.
+
+**Query Parameters:**
+| Param | Default | Description |
+|---|---|---|
+| `month` | current month | `YYYY-MM` — filters by `coverage_start`, same "production date" convention as the policy export's `month` filter |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Revenue summary retrieved",
+  "data": {
+    "month": "2026-08",
+    "totals": {
+      "policies_count": 42,
+      "total_premium": 210000000,
+      "total_commission_amount": 31500000,
+      "total_net_commission_amount": 30712500,
+      "total_customer_premium_amount": 195000000
+    },
+    "weekly": [
+      {
+        "week_start": "2026-08-01",
+        "week_end": "2026-08-02",
+        "policies_count": 3,
+        "total_premium": 15000000,
+        "total_commission_amount": 2250000,
+        "total_net_commission_amount": 2193750
+      },
+      {
+        "week_start": "2026-08-03",
+        "week_end": "2026-08-09",
+        "policies_count": 12,
+        "total_premium": 60000000,
+        "total_commission_amount": 9000000,
+        "total_net_commission_amount": 8775000
+      }
+    ],
+    "by_agent": [
+      {
+        "agent_id": null,
+        "agent_name": "Main Agent",
+        "policies_count": 20,
+        "total_premium": 100000000,
+        "total_commission_amount": 15000000,
+        "total_net_commission_amount": 14625000
+      },
+      {
+        "agent_id": "usr_sub001",
+        "agent_name": "Siti Aminah",
+        "policies_count": 22,
+        "total_premium": 110000000,
+        "total_commission_amount": 16500000,
+        "total_net_commission_amount": 16087500
+      }
+    ]
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `totals` | Whole-month production and commission totals |
+| `weekly[]` | Calendar weeks (Monday–Sunday), clipped to the month's start/end — the first/last entries may be partial weeks |
+| `by_agent[]` | Same breakdown grouped by `issuing_agent_id`; `agent_id: null` groups policies issued directly by the main agent |
+
+> `total_premium` is gross premium written (production), not commission received from the insurer — cross-check `total_commission_amount` / `total_net_commission_amount` against what the insurer actually pays using [CM-004 Mark Commission as Received](#cm-004--mark-commission-as-received).
+
+---
+
+## Services (Cron)
+
+**[NEW v1.1]** System-triggered endpoints, not meant for regular FE use.
+
+### SV-001 — Renewal Reminder
+
+**POST** `/api/v1/services/renewal-reminder`
+
+Sends each issuing agent a WhatsApp digest listing their policies entering the renewal window (default 30 days before `coverage_end`, per-company configurable via `renewal_reminder_days` — see [3.4](#34-update-notification-settings)). Each policy is only included once: a successful send stamps `policies.renewal_reminder_sent_at`, so re-running the same day (or retrying) never double-notifies an agent. A failed send leaves it unset so the next run retries it.
+
+**Auth — two ways to call this:**
+1. **Service token (for the daily cron).** Generate one once with:
+   ```
+   php mint-cron-token.php        # prints a ~10-year token to stdout
+   ```
+   This reuses the existing JWT signing path (`helpers/jwt.php`) — no new secret mechanism. The payload carries `service: "cron"` and no `company_id`, which is how the endpoint knows to run across **every** company that has policies, rather than being scoped to one tenant. Store the printed token wherever the external scheduler (crontab / hosting scheduler / Cloud Scheduler) keeps its secrets, and call this endpoint daily with:
+   ```
+   Authorization: Bearer <service-token>
+   ```
+2. **Normal user token.** A logged-in user's regular access token also works — the run is scoped to just that user's `company_id`. Useful for an FE "Kirim reminder sekarang" button or manual testing.
+
+> **Not yet wired up:** this repo has no scheduler of its own — nothing calls this endpoint automatically today. Whoever owns infra needs to point a daily job at it (with the service token above) for the 30-day reminder to actually go out.
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Renewal reminder run complete",
+  "data": {
+    "companies_processed": 3,
+    "agents_notified": 5,
+    "policies_included": 14,
+    "send_failures": [
+      { "company_id": "comp_002", "agent_id": "usr_sub009", "error": "No WhatsApp number on file" }
+    ]
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `companies_processed` | Companies checked (service-token calls only; always 1 for a scoped user call) |
+| `agents_notified` | Distinct agents who received a WhatsApp message this run |
+| `policies_included` | Total policies covered across all sent messages |
+| `send_failures[]` | Per-agent failures — no WhatsApp number on file, invalid number, or the WAHA send itself failing. These policies remain un-stamped and are retried on the next run. |
+
+Every send (success or failure) is also logged to `whatsapp_digest_logs` with `digest_type = "renewal_reminder"`, alongside the existing daily/monthly digest audit trail.

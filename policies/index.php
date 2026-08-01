@@ -244,6 +244,9 @@ function createPolicy($conn, $input, $username, $company_id){
                             ? "'" . mysqli_real_escape_string($conn, $input['previous_policy_id']) . "'" : 'NULL';
     $object_insured     = isset($input['object_insured'])  && trim($input['object_insured'])  !== ''
                             ? "'" . mysqli_real_escape_string($conn, trim($input['object_insured'])) . "'"  : 'NULL';
+    // [NEW v1.1] insured_name: optional "nama tertanggung" override, falls back to customer.display_name when NULL.
+    $insured_name       = isset($input['insured_name']) && trim($input['insured_name']) !== ''
+                            ? "'" . mysqli_real_escape_string($conn, trim($input['insured_name'])) . "'"     : 'NULL';
     $coverage_notes     = isset($input['coverage_notes']) && trim($input['coverage_notes']) !== ''
                             ? "'" . mysqli_real_escape_string($conn, trim($input['coverage_notes'])) . "'" : 'NULL';
     $notes              = isset($input['notes'])          && trim($input['notes'])          !== ''
@@ -255,7 +258,7 @@ function createPolicy($conn, $input, $username, $company_id){
 
     $sql = "INSERT INTO " . APP_SCHEMA . ".policies
         (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
-         product_type, policy_year, previous_policy_id, object_insured, sum_insured, coverage_notes, construction_class,
+         product_type, policy_year, previous_policy_id, object_insured, insured_name, sum_insured, coverage_notes, construction_class,
          coverage_start, coverage_end,
          premium_amount, materai_amount, biaya_polis, diskon,
          renewal_status, payment_status,
@@ -264,7 +267,7 @@ function createPolicy($conn, $input, $username, $company_id){
          is_coassurance, notes, created_by, created_at)
         VALUES
         ('$policy_id', '$company_id', '$insurer_id', '$customer_id', $issuing_agent_id, '$policy_number', $agent_code_used,
-         '$product_type', $policy_year, $previous_policy_id, $object_insured, $sum_insured, $coverage_notes, $construction_class,
+         '$product_type', $policy_year, $previous_policy_id, $object_insured, $insured_name, $sum_insured, $coverage_notes, $construction_class,
          '$coverage_start', '$coverage_end',
          $premium_amount, $materai_amount, $biaya_polis, $diskon,
          'pending', 'unpaid',
@@ -347,7 +350,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     $check = mysqli_query($conn,
         "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
-                object_insured, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
+                object_insured, insured_name, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
@@ -360,6 +363,11 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     if (isset($input['object_insured'])) {
         $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
         $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    // [NEW v1.1] insured_name: optional "nama tertanggung" override, falls back to customer.display_name when NULL.
+    if (isset($input['insured_name'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['insured_name']));
+        $updates[] = "insured_name = " . ($val !== '' ? "'$val'" : 'NULL');
     }
     if (isset($input['sum_insured'])) {
         $updates[] = "sum_insured = " . (int)$input['sum_insured'];
@@ -454,6 +462,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         $after  = [];
         $label_map = [
             'object_insured'      => 'objek pertanggungan',
+            'insured_name'        => 'nama tertanggung',
             'sum_insured'         => 'uang pertanggungan',
             'coverage_notes'      => 'catatan pertanggungan',
             'construction_class'  => 'kelas konstruksi',
@@ -505,7 +514,7 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
 
     $check = mysqli_query($conn,
         "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
-                object_insured, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
+                object_insured, insured_name, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
@@ -518,6 +527,11 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
     if (isset($input['object_insured'])) {
         $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
         $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    // [NEW v1.1] insured_name: optional "nama tertanggung" override, falls back to customer.display_name when NULL.
+    if (isset($input['insured_name'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['insured_name']));
+        $updates[] = "insured_name = " . ($val !== '' ? "'$val'" : 'NULL');
     }
     if (isset($input['sum_insured'])) {
         $updates[] = "sum_insured = " . (int)$input['sum_insured'];
@@ -604,6 +618,7 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET " . implode(', ', $updates) . " WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
         $label_map = [
             'object_insured'      => 'objek pertanggungan',
+            'insured_name'        => 'nama tertanggung',
             'sum_insured'         => 'uang pertanggungan',
             'coverage_notes'      => 'catatan pertanggungan',
             'construction_class'  => 'kelas konstruksi',
@@ -965,6 +980,10 @@ try {
             // [NEW v1.1] Co-assurance participants for this policy.
             case 'coassurance':
                 require __DIR__ . '/coassurance.php';
+                break;
+            // [NEW v1.1] Renew — creates the next policy_year record from this one.
+            case 'renew':
+                require __DIR__ . '/renew.php';
                 break;
             case 'logs':
                 if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }

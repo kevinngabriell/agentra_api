@@ -77,6 +77,10 @@ switch ($module) {
         require __DIR__ . '/master-products/index.php';
         break;
 
+    case 'revenue':
+        require __DIR__ . '/revenue/index.php';
+        break;
+
     case 'commissions':
         require __DIR__ . '/commissions/index.php';
         break;
