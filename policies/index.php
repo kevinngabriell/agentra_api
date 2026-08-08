@@ -256,9 +256,60 @@ function createPolicy($conn, $input, $username, $company_id){
     $construction_class  = isset($input['construction_class']) && in_array(strtoupper(trim($input['construction_class'])), $valid_classes, true)
                             ? "'" . strtoupper(trim($input['construction_class'])) . "'" : 'NULL';
 
+    // [NEW v1.2.0] Risk location: structured address + coordinates for the insured property.
+    // Manual entry only for now — no geocoding. Feeds the future map/fire-proximity feature.
+    $risk_address  = isset($input['risk_address'])  && trim($input['risk_address'])  !== ''
+                        ? "'" . mysqli_real_escape_string($conn, trim($input['risk_address']))  . "'" : 'NULL';
+    $risk_village  = isset($input['risk_village'])  && trim($input['risk_village'])  !== ''
+                        ? "'" . mysqli_real_escape_string($conn, trim($input['risk_village']))  . "'" : 'NULL';
+    $risk_district = isset($input['risk_district']) && trim($input['risk_district']) !== ''
+                        ? "'" . mysqli_real_escape_string($conn, trim($input['risk_district'])) . "'" : 'NULL';
+    $risk_city     = isset($input['risk_city'])     && trim($input['risk_city'])     !== ''
+                        ? "'" . mysqli_real_escape_string($conn, trim($input['risk_city']))     . "'" : 'NULL';
+    $risk_province = isset($input['risk_province']) && trim($input['risk_province']) !== ''
+                        ? "'" . mysqli_real_escape_string($conn, trim($input['risk_province'])) . "'" : 'NULL';
+
+    $risk_postal_code = 'NULL';
+    if (isset($input['risk_postal_code']) && trim($input['risk_postal_code']) !== '') {
+        $rpc = trim(mysqli_real_escape_string($conn, $input['risk_postal_code']));
+        if (!preg_match('/^\d{5}$/', $rpc)) {
+            jsonResponse(400, 'risk_postal_code must be a 5-digit Indonesian postal code (e.g. "17530")');
+            return;
+        }
+        $risk_postal_code = "'$rpc'";
+    }
+
+    $risk_latitude  = 'NULL';
+    $risk_longitude = 'NULL';
+    $has_risk_lat = isset($input['risk_latitude'])  && $input['risk_latitude']  !== '' && $input['risk_latitude']  !== null;
+    $has_risk_lng = isset($input['risk_longitude']) && $input['risk_longitude'] !== '' && $input['risk_longitude'] !== null;
+    if ($has_risk_lat xor $has_risk_lng) {
+        jsonResponse(400, 'risk_latitude and risk_longitude must be provided together');
+        return;
+    }
+    if ($has_risk_lat && $has_risk_lng) {
+        if (!is_numeric($input['risk_latitude']) || !is_numeric($input['risk_longitude'])) {
+            jsonResponse(400, 'risk_latitude and risk_longitude must be numbers');
+            return;
+        }
+        $risk_lat = (float)$input['risk_latitude'];
+        $risk_lng = (float)$input['risk_longitude'];
+        if ($risk_lat < -90 || $risk_lat > 90) {
+            jsonResponse(400, 'risk_latitude must be between -90 and 90');
+            return;
+        }
+        if ($risk_lng < -180 || $risk_lng > 180) {
+            jsonResponse(400, 'risk_longitude must be between -180 and 180');
+            return;
+        }
+        $risk_latitude  = sprintf('%.7f', $risk_lat);
+        $risk_longitude = sprintf('%.7f', $risk_lng);
+    }
+
     $sql = "INSERT INTO " . APP_SCHEMA . ".policies
         (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
          product_type, policy_year, previous_policy_id, object_insured, insured_name, sum_insured, coverage_notes, construction_class,
+         risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
          coverage_start, coverage_end,
          premium_amount, materai_amount, biaya_polis, diskon,
          renewal_status, payment_status,
@@ -268,6 +319,7 @@ function createPolicy($conn, $input, $username, $company_id){
         VALUES
         ('$policy_id', '$company_id', '$insurer_id', '$customer_id', $issuing_agent_id, '$policy_number', $agent_code_used,
          '$product_type', $policy_year, $previous_policy_id, $object_insured, $insured_name, $sum_insured, $coverage_notes, $construction_class,
+         $risk_address, $risk_village, $risk_district, $risk_city, $risk_province, $risk_postal_code, $risk_latitude, $risk_longitude,
          '$coverage_start', '$coverage_end',
          $premium_amount, $materai_amount, $biaya_polis, $diskon,
          'pending', 'unpaid',
@@ -350,7 +402,9 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     $check = mysqli_query($conn,
         "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
-                object_insured, insured_name, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
+                object_insured, insured_name, sum_insured, coverage_notes, construction_class,
+                risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
+                coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
@@ -386,6 +440,67 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         } else {
             jsonResponse(400, 'construction_class must be I, II, or III');
             return;
+        }
+    }
+    // [NEW v1.2.0] Risk location: structured address + coordinates for the insured property.
+    if (isset($input['risk_address'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_address']));
+        $updates[] = "risk_address = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_village'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_village']));
+        $updates[] = "risk_village = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_district'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_district']));
+        $updates[] = "risk_district = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_city'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_city']));
+        $updates[] = "risk_city = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_province'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_province']));
+        $updates[] = "risk_province = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_postal_code'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_postal_code']));
+        if ($val !== '' && !preg_match('/^\d{5}$/', $val)) {
+            jsonResponse(400, 'risk_postal_code must be a 5-digit Indonesian postal code (e.g. "17530")');
+            return;
+        }
+        $updates[] = "risk_postal_code = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_latitude']) || isset($input['risk_longitude'])) {
+        $risk_lat_raw = $input['risk_latitude']  ?? null;
+        $risk_lng_raw = $input['risk_longitude'] ?? null;
+        $has_risk_lat = $risk_lat_raw !== null && $risk_lat_raw !== '';
+        $has_risk_lng = $risk_lng_raw !== null && $risk_lng_raw !== '';
+        if ($has_risk_lat xor $has_risk_lng) {
+            jsonResponse(400, 'risk_latitude and risk_longitude must be provided together');
+            return;
+        }
+        if ($has_risk_lat && $has_risk_lng) {
+            if (!is_numeric($risk_lat_raw) || !is_numeric($risk_lng_raw)) {
+                jsonResponse(400, 'risk_latitude and risk_longitude must be numbers');
+                return;
+            }
+            $risk_lat = (float)$risk_lat_raw;
+            $risk_lng = (float)$risk_lng_raw;
+            if ($risk_lat < -90 || $risk_lat > 90) {
+                jsonResponse(400, 'risk_latitude must be between -90 and 90');
+                return;
+            }
+            if ($risk_lng < -180 || $risk_lng > 180) {
+                jsonResponse(400, 'risk_longitude must be between -180 and 180');
+                return;
+            }
+            $updates[] = "risk_latitude = "  . sprintf('%.7f', $risk_lat);
+            $updates[] = "risk_longitude = " . sprintf('%.7f', $risk_lng);
+        } else {
+            // Both explicitly cleared → remove the pin.
+            $updates[] = "risk_latitude = NULL";
+            $updates[] = "risk_longitude = NULL";
         }
     }
     if (isset($input['coverage_start'])) {
@@ -466,6 +581,14 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
             'sum_insured'         => 'uang pertanggungan',
             'coverage_notes'      => 'catatan pertanggungan',
             'construction_class'  => 'kelas konstruksi',
+            'risk_address'        => 'alamat lokasi risiko',
+            'risk_village'        => 'kelurahan/desa',
+            'risk_district'       => 'kecamatan',
+            'risk_city'           => 'kota/kabupaten',
+            'risk_province'       => 'provinsi',
+            'risk_postal_code'    => 'kode pos',
+            'risk_latitude'       => 'latitude lokasi risiko',
+            'risk_longitude'      => 'longitude lokasi risiko',
             'coverage_start'      => 'mulai pertanggungan',
             'coverage_end'        => 'akhir pertanggungan',
             'premium_amount'      => 'premi',
@@ -514,7 +637,9 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
 
     $check = mysqli_query($conn,
         "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
-                object_insured, insured_name, sum_insured, coverage_notes, construction_class, coverage_start, coverage_end, notes
+                object_insured, insured_name, sum_insured, coverage_notes, construction_class,
+                risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
+                coverage_start, coverage_end, notes
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
@@ -550,6 +675,67 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
         } else {
             jsonResponse(400, 'construction_class must be I, II, or III');
             return;
+        }
+    }
+    // [NEW v1.2.0] Risk location: structured address + coordinates for the insured property.
+    if (isset($input['risk_address'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_address']));
+        $updates[] = "risk_address = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_village'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_village']));
+        $updates[] = "risk_village = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_district'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_district']));
+        $updates[] = "risk_district = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_city'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_city']));
+        $updates[] = "risk_city = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_province'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_province']));
+        $updates[] = "risk_province = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_postal_code'])) {
+        $val = trim(mysqli_real_escape_string($conn, $input['risk_postal_code']));
+        if ($val !== '' && !preg_match('/^\d{5}$/', $val)) {
+            jsonResponse(400, 'risk_postal_code must be a 5-digit Indonesian postal code (e.g. "17530")');
+            return;
+        }
+        $updates[] = "risk_postal_code = " . ($val !== '' ? "'$val'" : 'NULL');
+    }
+    if (isset($input['risk_latitude']) || isset($input['risk_longitude'])) {
+        $risk_lat_raw = $input['risk_latitude']  ?? null;
+        $risk_lng_raw = $input['risk_longitude'] ?? null;
+        $has_risk_lat = $risk_lat_raw !== null && $risk_lat_raw !== '';
+        $has_risk_lng = $risk_lng_raw !== null && $risk_lng_raw !== '';
+        if ($has_risk_lat xor $has_risk_lng) {
+            jsonResponse(400, 'risk_latitude and risk_longitude must be provided together');
+            return;
+        }
+        if ($has_risk_lat && $has_risk_lng) {
+            if (!is_numeric($risk_lat_raw) || !is_numeric($risk_lng_raw)) {
+                jsonResponse(400, 'risk_latitude and risk_longitude must be numbers');
+                return;
+            }
+            $risk_lat = (float)$risk_lat_raw;
+            $risk_lng = (float)$risk_lng_raw;
+            if ($risk_lat < -90 || $risk_lat > 90) {
+                jsonResponse(400, 'risk_latitude must be between -90 and 90');
+                return;
+            }
+            if ($risk_lng < -180 || $risk_lng > 180) {
+                jsonResponse(400, 'risk_longitude must be between -180 and 180');
+                return;
+            }
+            $updates[] = "risk_latitude = "  . sprintf('%.7f', $risk_lat);
+            $updates[] = "risk_longitude = " . sprintf('%.7f', $risk_lng);
+        } else {
+            // Both explicitly cleared → remove the pin.
+            $updates[] = "risk_latitude = NULL";
+            $updates[] = "risk_longitude = NULL";
         }
     }
     if (isset($input['coverage_start'])) {
@@ -622,6 +808,14 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
             'sum_insured'         => 'uang pertanggungan',
             'coverage_notes'      => 'catatan pertanggungan',
             'construction_class'  => 'kelas konstruksi',
+            'risk_address'        => 'alamat lokasi risiko',
+            'risk_village'        => 'kelurahan/desa',
+            'risk_district'       => 'kecamatan',
+            'risk_city'           => 'kota/kabupaten',
+            'risk_province'       => 'provinsi',
+            'risk_postal_code'    => 'kode pos',
+            'risk_latitude'       => 'latitude lokasi risiko',
+            'risk_longitude'      => 'longitude lokasi risiko',
             'coverage_start'      => 'mulai pertanggungan',
             'coverage_end'        => 'akhir pertanggungan',
             'premium_amount'      => 'premi',

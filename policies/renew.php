@@ -75,6 +75,48 @@ if (isset($input['construction_class'])) {
     $construction_class = in_array($cc, ['I', 'II', 'III'], true) ? $cc : null;
 }
 
+// [NEW v1.2.0] Risk location — carried forward from the source policy (the insured
+// building essentially never changes on renewal), individually overridable.
+$risk_address  = isset($input['risk_address'])  ? trim($input['risk_address'])  : $src['risk_address'];
+$risk_village  = isset($input['risk_village'])  ? trim($input['risk_village'])  : $src['risk_village'];
+$risk_district = isset($input['risk_district']) ? trim($input['risk_district']) : $src['risk_district'];
+$risk_city     = isset($input['risk_city'])     ? trim($input['risk_city'])     : $src['risk_city'];
+$risk_province = isset($input['risk_province']) ? trim($input['risk_province']) : $src['risk_province'];
+
+$risk_postal_code = isset($input['risk_postal_code']) ? trim($input['risk_postal_code']) : $src['risk_postal_code'];
+if ($risk_postal_code !== null && $risk_postal_code !== '' && !preg_match('/^\d{5}$/', $risk_postal_code)) {
+    jsonResponse(400, 'risk_postal_code must be a 5-digit Indonesian postal code (e.g. "17530")');
+}
+
+if (isset($input['risk_latitude']) || isset($input['risk_longitude'])) {
+    $risk_lat_raw = $input['risk_latitude']  ?? null;
+    $risk_lng_raw = $input['risk_longitude'] ?? null;
+    $has_risk_lat = $risk_lat_raw !== null && $risk_lat_raw !== '';
+    $has_risk_lng = $risk_lng_raw !== null && $risk_lng_raw !== '';
+    if ($has_risk_lat xor $has_risk_lng) {
+        jsonResponse(400, 'risk_latitude and risk_longitude must be provided together');
+    }
+    if ($has_risk_lat && $has_risk_lng) {
+        if (!is_numeric($risk_lat_raw) || !is_numeric($risk_lng_raw)) {
+            jsonResponse(400, 'risk_latitude and risk_longitude must be numbers');
+        }
+        $risk_latitude  = (float)$risk_lat_raw;
+        $risk_longitude = (float)$risk_lng_raw;
+        if ($risk_latitude < -90 || $risk_latitude > 90) {
+            jsonResponse(400, 'risk_latitude must be between -90 and 90');
+        }
+        if ($risk_longitude < -180 || $risk_longitude > 180) {
+            jsonResponse(400, 'risk_longitude must be between -180 and 180');
+        }
+    } else {
+        $risk_latitude  = null;
+        $risk_longitude = null;
+    }
+} else {
+    $risk_latitude  = $src['risk_latitude']  !== null ? (float)$src['risk_latitude']  : null;
+    $risk_longitude = $src['risk_longitude'] !== null ? (float)$src['risk_longitude'] : null;
+}
+
 $materai_amount = isset($input['materai_amount']) ? max(0, (int)$input['materai_amount']) : (int)$src['materai_amount'];
 $biaya_polis    = isset($input['biaya_polis'])    ? max(0, (int)$input['biaya_polis'])    : (int)$src['biaya_polis'];
 $diskon         = isset($input['diskon'])         ? max(0, (int)$input['diskon'])         : (int)$src['diskon'];
@@ -108,9 +150,19 @@ $nt  = $notes           !== null && $notes           !== '' ? "'" . mysqli_real_
 $cc  = $construction_class ? "'" . mysqli_real_escape_string($conn, $construction_class) . "'" : 'NULL';
 $iag = $src['issuing_agent_id'] ? "'" . mysqli_real_escape_string($conn, $src['issuing_agent_id']) . "'" : 'NULL';
 
+$ra   = $risk_address     !== null && $risk_address     !== '' ? "'" . mysqli_real_escape_string($conn, $risk_address)     . "'" : 'NULL';
+$rv   = $risk_village     !== null && $risk_village     !== '' ? "'" . mysqli_real_escape_string($conn, $risk_village)     . "'" : 'NULL';
+$rd   = $risk_district    !== null && $risk_district    !== '' ? "'" . mysqli_real_escape_string($conn, $risk_district)    . "'" : 'NULL';
+$rc   = $risk_city        !== null && $risk_city        !== '' ? "'" . mysqli_real_escape_string($conn, $risk_city)        . "'" : 'NULL';
+$rp   = $risk_province    !== null && $risk_province    !== '' ? "'" . mysqli_real_escape_string($conn, $risk_province)    . "'" : 'NULL';
+$rpc  = $risk_postal_code !== null && $risk_postal_code !== '' ? "'" . mysqli_real_escape_string($conn, $risk_postal_code) . "'" : 'NULL';
+$rlat = $risk_latitude    !== null ? sprintf('%.7f', $risk_latitude)  : 'NULL';
+$rlng = $risk_longitude   !== null ? sprintf('%.7f', $risk_longitude) : 'NULL';
+
 $ok = mysqli_query($conn, "INSERT INTO " . APP_SCHEMA . ".policies
     (policy_id, company_id, insurer_id, customer_id, issuing_agent_id, policy_number, agent_code_used,
      product_type, policy_year, previous_policy_id, object_insured, insured_name, sum_insured, coverage_notes, construction_class,
+     risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
      coverage_start, coverage_end,
      premium_amount, materai_amount, biaya_polis, diskon,
      renewal_status, payment_status,
@@ -121,6 +173,7 @@ $ok = mysqli_query($conn, "INSERT INTO " . APP_SCHEMA . ".policies
     ('$new_policy_id', '$company_id', '{$src['insurer_id']}', '{$src['customer_id']}', $iag, '$new_policy_number',
      " . ($src['agent_code_used'] ? "'" . mysqli_real_escape_string($conn, $src['agent_code_used']) . "'" : 'NULL') . ",
      '{$src['product_type']}', $policy_year, '$policy_id', $oi, $insured_name, $sum_insured, $cn, $cc,
+     $ra, $rv, $rd, $rc, $rp, $rpc, $rlat, $rlng,
      '$coverage_start', '$coverage_end',
      $premium_amount, $materai_amount, $biaya_polis, $diskon,
      'pending', 'unpaid',
