@@ -2,6 +2,59 @@
 
 ---
 
+## ⚠️ What's New — v1.3.0 (FE Team: Action Required)
+
+> No SQL migration on the Agentra schema — this reads reference tables that are already populated in the shared core schema (`movira_core_dev`). Nothing to run before deploying.
+
+### Master Wilayah — cascading region lookup (Province → City → District → Village)
+
+New read-only endpoints for Indonesia's administrative regions, meant to replace free-text typing for `risk_province` / `risk_city` / `risk_district` / `risk_village` (added in v1.2.0, see below) with a real cascading picker.
+
+**Base path:** `/api/v1/master-wilayah` — full reference: [Master Wilayah — Region Lookup](#master-wilayah--region-lookup)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /master-wilayah/provinces` | All provinces (38) |
+| `GET /master-wilayah/cities?province_code=` | Cities/regencies in a province |
+| `GET /master-wilayah/districts?city_code=` | Districts (kecamatan) in a city |
+| `GET /master-wilayah/villages?district_code=` | Villages (kelurahan/desa) in a district |
+
+**What we expect from the FE integration:**
+1. **Treat it as one cascading picker, not four independent dropdowns.** Cities/districts/villages each require their parent's `*_code` as a query param — don't fire that call until the user has picked the level above, and reset/disable every downstream select whenever an upstream one changes.
+2. **Chain on `*_code`, but save `*_name`.** `policies.risk_province/risk_city/risk_district/risk_village` are still plain free-text columns (v1.2.0 was schema-only, no FK to these tables yet). When the user picks a row, use its `*_code` to fetch the next level, but write its `*_name` string into the corresponding `risk_*` field on `POST`/`PUT` `/policies` — exactly as if they'd typed it themselves.
+3. **Data coverage is partial today, by design of the ongoing sync — not a bug.** Only Sumatera's provinces + DKI Jakarta have cities/districts/villages loaded right now; every other province currently returns `404 "No cities found"` from `/cities`. Please don't treat that 404 as an error state — fall back to a manual text input for that field ("region not listed yet? type it") rather than blocking the form. This fills in automatically as the upstream sync completes; no FE change needed when it does.
+4. Same auth as everything else: `Authorization: Bearer <access_token>` required on all four endpoints.
+
+---
+
+## ⚠️ What's New — v1.2.0 (FE Team: Action Required)
+
+> **SQL migration required before deploying this version:**
+> - `migration_policy_risk_location.sql` — adds `policies.risk_address`, `risk_village`, `risk_district`, `risk_city`, `risk_province`, `risk_postal_code`, `risk_latitude`, `risk_longitude`
+>
+> Additive/nullable-default, safe to run on a live DB. No backfill needed.
+
+### Policy Risk Location — structured address + coordinates for the insured property
+
+Today the insured property's location lives only inside the free-text `object_insured` field (e.g. `"Gudang, Jl. Industri No. 5"`) — the same field the policy export labels "LOKASI PERTANGGUNGAN". This adds eight optional structured fields on `policies` to capture that location properly, laying groundwork for a future "find insured properties near a fire" map feature. **Not built in this release** — no geocoding, no map UI here; `risk_latitude`/`risk_longitude` are plain manual-entry fields for now.
+
+**Policy-level, like `construction_class`** — one customer can hold multiple fire policies for different physical properties, so risk location lives on the policy, not the customer.
+
+| Field | Type | Description |
+|---|---|---|
+| `risk_address` | string | Street address of the insured property |
+| `risk_village` | string | Kelurahan/Desa |
+| `risk_district` | string | Kecamatan |
+| `risk_city` | string | Kota/Kabupaten |
+| `risk_province` | string | Provinsi |
+| `risk_postal_code` | string | 5-digit postal code, e.g. `"17530"` |
+| `risk_latitude` | float | -90 to 90. Must be sent together with `risk_longitude`. |
+| `risk_longitude` | float | -180 to 180. Must be sent together with `risk_latitude`. |
+
+FE: `object_insured` is unchanged and keeps describing *what* is insured (e.g. "Gudang" / "Ruko 2 lantai") — these new fields describe *where* it is. All eight are optional. `risk_latitude`/`risk_longitude` have no automatic geocoding yet — if you only have a text address, leave them blank; consider a single "pin on map" input control that fills both together, since the API rejects sending just one of the pair. Available on `POST /policies`, `PUT /policies/{id}`, `PATCH /policies/{id}`, and `POST /policies/{id}/renew` (carried forward from the source policy, individually overridable). Returned (null until set) on `GET /policies/{id}`.
+
+---
+
 ## ⚠️ What's New — v1.1.0 (FE Team: Action Required)
 
 > **SQL migrations required before deploying this version:**
@@ -1051,6 +1104,14 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
   "previous_policy_id": null,
   "object_insured": "Toyota Avanza 2020 - B 1234 XYZ",
   "coverage_notes": "Comprehensive with flood extension",
+  "risk_address": "Jl. Industri No. 5, RT 003/RW 002",
+  "risk_village": "Sukamaju",
+  "risk_district": "Cibinong",
+  "risk_city": "Kabupaten Bogor",
+  "risk_province": "Jawa Barat",
+  "risk_postal_code": "16916",
+  "risk_latitude": -6.481,
+  "risk_longitude": 106.854,
   "notes": "Renewal from last year"
 }
 ```
@@ -1075,6 +1136,14 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
 | `insured_name` | string | No | **[NEW v1.1]** Optional "nama tertanggung" override for policy documents. Falls back to the customer's `display_name` when omitted. |
 | coverage_notes | string | No | Coverage details |
 | construction_class | string | No | Fire insurance only: `"I"`, `"II"`, or `"III"`. Omit or send `null` for non-fire products. |
+| `risk_address` | string | No | **[NEW v1.2.0]** Street address of the insured property (risk location). |
+| `risk_village` | string | No | **[NEW v1.2.0]** Kelurahan/Desa. |
+| `risk_district` | string | No | **[NEW v1.2.0]** Kecamatan. |
+| `risk_city` | string | No | **[NEW v1.2.0]** Kota/Kabupaten. |
+| `risk_province` | string | No | **[NEW v1.2.0]** Provinsi. |
+| `risk_postal_code` | string | No | **[NEW v1.2.0]** 5-digit Indonesian postal code, e.g. `"17530"`. |
+| `risk_latitude` | float | No | **[NEW v1.2.0]** -90 to 90. Must be provided together with `risk_longitude`. Manual entry — no automatic geocoding. |
+| `risk_longitude` | float | No | **[NEW v1.2.0]** -180 to 180. Must be provided together with `risk_latitude`. |
 | notes | string | No | Internal notes |
 | previous_policy_id | string | No | For renewals |
 
@@ -1145,6 +1214,9 @@ Auth required. Commission breakdown is auto-recalculated whenever any financial 
   "object_insured": "Toyota Avanza 2021 - B 1234 XYZ",
   "coverage_notes": "Comprehensive + flood + earthquake",
   "construction_class": "I",
+  "risk_address": "Jl. Industri No. 5, RT 003/RW 002",
+  "risk_latitude": -6.481,
+  "risk_longitude": 106.854,
   "notes": "Updated after endorsement"
 }
 ```
@@ -1156,6 +1228,9 @@ Auth required. Commission breakdown is auto-recalculated whenever any financial 
 | `sum_insured` | int | New TSI in IDR |
 | `coverage_notes` | string | Coverage clause notes |
 | `construction_class` | string\|null | `"I"`, `"II"`, `"III"`, or `null` to clear |
+| `risk_address` / `risk_village` / `risk_district` / `risk_city` / `risk_province` | string\|null | **[NEW v1.2.0]** Structured risk-location address fields. Send `null` or `""` to clear. |
+| `risk_postal_code` | string\|null | **[NEW v1.2.0]** 5-digit postal code, or `null` to clear. |
+| `risk_latitude` / `risk_longitude` | float\|null | **[NEW v1.2.0]** Must be sent together (both set, or both `null`/omitted to leave unchanged). Send both as `null` to remove the pin. |
 | `coverage_start` | string | YYYY-MM-DD |
 | `coverage_end` | string | YYYY-MM-DD |
 | `premium_amount` | int | Gross premium |
@@ -1179,7 +1254,7 @@ Auth required. Commission breakdown is auto-recalculated whenever any financial 
 
 **PATCH** `/api/v1/policies/{policy_id}`
 
-Auth required. Updates policy fields **without** creating an endorsement entry in the audit log. Use this to correct data entry mistakes. Accepts the same fields as `PUT`. Commission breakdown is still recalculated and synced when financial fields are provided.
+Auth required. Updates policy fields **without** creating an endorsement entry in the audit log. Use this to correct data entry mistakes. Accepts the same fields as `PUT`, including the **[NEW v1.2.0]** `risk_*` fields (see [What's New — v1.2.0](#-whats-new--v120-fe-team-action-required)). Commission breakdown is still recalculated and synced when financial fields are provided.
 
 > **When to use PATCH vs PUT:**
 > - Use `PUT` for formal policy changes (mid-term changes, agreed amendments) — creates an endorsement log.
@@ -1658,6 +1733,8 @@ Auth required. **[NEW v1.1]** Creates the next `policy_year` record from an expi
 }
 ```
 
+> **[NEW v1.2.0]** The `risk_*` fields (`risk_address`, `risk_village`, `risk_district`, `risk_city`, `risk_province`, `risk_postal_code`, `risk_latitude`, `risk_longitude`) are also carried forward from the source policy — the insured building is essentially always the same on renewal — and are individually overridable in the request body, same as `object_insured`.
+
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `policy_number` | string | **Yes** | New policy number for the renewed period. Must be unique per company. |
@@ -1669,6 +1746,8 @@ Auth required. **[NEW v1.1]** Creates the next `policy_year` record from an expi
 | `sum_insured` / `premium_amount` | integer | No | Only used when the source policy has no `policy_coverages` rows — ignored (recomputed) otherwise. Defaults to source's values. |
 | `materai_amount` / `biaya_polis` / `diskon` | integer | No | Default to the source policy's values. |
 | `object_insured` / `coverage_notes` / `construction_class` / `notes` | string | No | Default to the source policy's values. |
+| `risk_address` / `risk_village` / `risk_district` / `risk_city` / `risk_province` / `risk_postal_code` | string | No | **[NEW v1.2.0]** Default to the source policy's values. |
+| `risk_latitude` / `risk_longitude` | float | No | **[NEW v1.2.0]** Default to the source policy's values. Must be provided together if overriding. |
 
 **Behavior:**
 - The **source** policy is marked `renewal_status = "renewed"` and logged (`renewal_status_changed`).
@@ -1821,6 +1900,133 @@ If neither matches, the request returns `400`. Pass `commission_rate` explicitly
 | `kecelakaan` | Kecelakaan Diri | 20% | — |
 
 ---
+
+---
+
+## Master Wilayah — Region Lookup
+
+> ⭐ **NEW in v1.3.0**
+
+Cascading Province → City (Regency) → District → Village lookup for Indonesia's administrative regions, mirrored from wilayah.id into the shared core schema. Read-only reference data — there's no create/update/delete here, it exists to drive autocomplete for the `risk_province`/`risk_city`/`risk_district`/`risk_village` fields on policies (see **v1.2.0 — Policy Risk Location** above).
+
+**Base path:** `/api/v1/master-wilayah`
+
+All endpoints are `GET` and require `Authorization: Bearer <access_token>`.
+
+---
+
+### MW-001 — List Provinces
+
+**GET** `/api/v1/master-wilayah/provinces`
+
+No parameters — returns all active provinces.
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Provinces found",
+  "data": {
+    "data": [
+      { "province_id": "prova58fb63d90f4a6f7", "province_code": "11", "province_name": "Aceh" },
+      { "province_id": "provfbb7e699f0a966a5", "province_code": "31", "province_name": "DKI Jakarta" },
+      { "province_id": "prov0e0e0545f13c2f73", "province_code": "32", "province_name": "Jawa Barat" }
+    ]
+  }
+}
+```
+
+---
+
+### MW-002 — List Cities
+
+**GET** `/api/v1/master-wilayah/cities?province_code={province_code}`
+
+| Query param | Required | Description |
+|---|---|---|
+| `province_code` | **Yes** | `province_code` of a row from MW-001, e.g. `"31"` |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Cities found",
+  "data": {
+    "data": [
+      { "city_id": "city70b695028f2bff6f", "province_id": "prova58fb63d90f4a6f7", "city_code": "11.71", "city_name": "Kota Banda Aceh" },
+      { "city_id": "city960bbd4900bca248", "province_id": "prova58fb63d90f4a6f7", "city_code": "11.05", "city_name": "Kabupaten Aceh Barat" }
+    ]
+  }
+}
+```
+
+**Response `400`** — `province_code` missing:
+```json
+{ "status_code": 400, "status_message": "province_code is required", "data": [] }
+```
+
+**Response `404`** — valid province, no cities loaded for it yet (expected for most provinces right now — see coverage note in the v1.3.0 changelog):
+```json
+{ "status_code": 404, "status_message": "No cities found", "data": [] }
+```
+
+---
+
+### MW-003 — List Districts
+
+**GET** `/api/v1/master-wilayah/districts?city_code={city_code}`
+
+| Query param | Required | Description |
+|---|---|---|
+| `city_code` | **Yes** | `city_code` of a row from MW-002, e.g. `"31.71"` |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Districts found",
+  "data": {
+    "data": [
+      { "district_id": "distf9d0c6ae79f6b068", "city_id": "city70b695028f2bff6f", "district_code": "31.71.05", "district_name": "Cempaka Putih" }
+    ]
+  }
+}
+```
+
+Same `400`/`404` shape as MW-002 for a missing/empty `city_code`.
+
+---
+
+### MW-004 — List Villages
+
+**GET** `/api/v1/master-wilayah/villages?district_code={district_code}`
+
+| Query param | Required | Description |
+|---|---|---|
+| `district_code` | **Yes** | `district_code` of a row from MW-003, e.g. `"31.71.05"` |
+
+**Response `200`:**
+```json
+{
+  "status_code": 200,
+  "status_message": "Villages found",
+  "data": {
+    "data": [
+      { "village_id": "vill11926bce8d8aa635", "district_id": "distf9d0c6ae79f6b068", "village_code": "31.71.05.1002", "village_name": "Cempaka Putih Barat" }
+    ]
+  }
+}
+```
+
+Same `400`/`404` shape as MW-002 for a missing/empty `district_code`.
+
+---
+
+> ⭐ **FE implementation notes:**
+> 1. Suggested UI: province `<select>` → on change, call MW-002 with its `province_code` and populate the city `<select>` (kept disabled until a province is picked). Repeat the pattern for district (MW-003) and village (MW-004). Clear and disable every downstream select whenever an upstream one changes.
+> 2. Use the `*_code` fields to drive the cascade (that's what each next-level call takes as a query param), but write the matching `*_name` into `risk_province`/`risk_city`/`risk_district`/`risk_village` when you submit the policy — those stay free-text columns for now, not FKs to these tables.
+> 3. A `404` from MW-002/003/004 means "no data synced for this parent yet," not a broken request — offer a manual text-entry fallback for that field instead of blocking the form. See the coverage note in the v1.3.0 changelog for which provinces are populated today.
+> 4. `city_name`/`district_name`/`village_name` already carry their official prefix where relevant (e.g. `"Kabupaten Aceh Barat"`, `"Kota Banda Aceh"`) — display them as returned, no need to prepend your own label.
 
 ---
 
