@@ -25,6 +25,30 @@ New read-only endpoints for Indonesia's administrative regions, meant to replace
 3. **Data coverage is partial today, by design of the ongoing sync — not a bug.** Only Sumatera's provinces + DKI Jakarta have cities/districts/villages loaded right now; every other province currently returns `404 "No cities found"` from `/cities`. Please don't treat that 404 as an error state — fall back to a manual text input for that field ("region not listed yet? type it") rather than blocking the form. This fills in automatically as the upstream sync completes; no FE change needed when it does.
 4. Same auth as everything else: `Authorization: Bearer <access_token>` required on all four endpoints.
 
+### Create Policy — inline `coverages` (no endorsement log)
+
+**Bug fixed:** creating a policy with several *area pertanggungan* (coverage items) used to produce one `endorsement` entry in the policy audit log per item. The FE creates the policy and then calls `POST /policies/{id}/coverages` for each item, and every one of those calls is — correctly — an endorsement, because at that point the policy already exists. But an item entered while *creating* a policy is part of the policy as issued, so the history showed endorsements that never happened.
+
+**Fix:** `POST /policies` now accepts an optional `coverages` array. The items are saved together with the policy, and the audit log gets only the single `policy_created` entry.
+
+```json
+{
+  "insurer_id": "ins_xxx", "customer_id": "cst_xxx", "policy_number": "FR-001",
+  "product_type": "fire", "coverage_start": "2026-01-01", "coverage_end": "2027-01-01",
+  "coverages": [
+    { "coverage_type": "bangunan", "coverage_label": "Bangunan Utama", "sum_insured": 500000000, "rate_permille": 0.328 },
+    { "coverage_type": "stok",     "coverage_label": "Stok 1",         "sum_insured": 200000000, "rate_permille": 2.28 }
+  ]
+}
+```
+
+**FE action required:** on the **create** form, send the coverage rows in the `POST /policies` body and stop calling `POST /policies/{id}/coverages` for them. Keep using `/policies/{id}/coverages` (POST/PUT/DELETE) on the **edit** screen — those are real post-issuance changes and stay logged as `endorsement`. No SQL migration.
+
+- Each item has the same fields and validation as `POST /policies/{id}/coverages` (`coverage_type`, `sum_insured`, `rate_permille` required; `coverage_label`, `count_in_tsi` optional). Full reference: [Policy Coverages — §3.6](POLICY_COVERAGES_DOCUMENTATION.md#36-creating-a-policy-with-its-coverage-items-no-endorsement).
+- When `coverages` is sent, `sum_insured` and `premium_amount` are **no longer required** — they are derived from the items (and ignored if sent). Commission is computed from the derived premium.
+- All-or-nothing: a bad item returns `400` with `coverages[<index>]: <reason>` and nothing is saved.
+- Omitting `coverages` keeps the previous behaviour exactly (scalar `sum_insured` + `premium_amount` required).
+
 ---
 
 ## ⚠️ What's New — v1.2.0 (FE Team: Action Required)
@@ -52,6 +76,16 @@ Today the insured property's location lives only inside the free-text `object_in
 | `risk_longitude` | float | -180 to 180. Must be sent together with `risk_latitude`. |
 
 FE: `object_insured` is unchanged and keeps describing *what* is insured (e.g. "Gudang" / "Ruko 2 lantai") — these new fields describe *where* it is. All eight are optional. `risk_latitude`/`risk_longitude` have no automatic geocoding yet — if you only have a text address, leave them blank; consider a single "pin on map" input control that fills both together, since the API rejects sending just one of the pair. Available on `POST /policies`, `PUT /policies/{id}`, `PATCH /policies/{id}`, and `POST /policies/{id}/renew` (carried forward from the source policy, individually overridable). Returned (null until set) on `GET /policies/{id}`.
+
+### Policy Number — now editable
+
+`policy_number` can now be changed via `PUT /policies/{id}` and `PATCH /policies/{id}` (previously it was set at creation/renewal and could never be corrected). No migration needed.
+
+- Must be a non-empty string → otherwise `400`.
+- Must stay unique per company → `409 "Policy number already exists for this company"` if another policy already uses it. Re-sending the policy's *current* number is fine (no conflict, and it is not written to the audit log).
+- Logged in the audit log as `nomor polis` with `before`/`after` values. It never counts as an endorsement.
+- **Commission rate is not re-derived.** The rate is resolved from the policy-number prefix only at creation. Changing the number afterwards leaves `commission_rate` untouched — send `commission_rate` explicitly if the new prefix should change it.
+- Use `PATCH` for typo corrections (the normal case). Other policies' `previous_policy_id` links are by ID, so renewal chains are unaffected.
 
 ---
 
@@ -1124,8 +1158,9 @@ Auth required. Requires an existing `customer_id` and `insurer_id`.
 | product_type | string | Yes | Must match an active `product_code` in master products |
 | coverage_start | string | Yes | YYYY-MM-DD |
 | coverage_end | string | Yes | YYYY-MM-DD |
-| sum_insured | integer | Yes | Coverage amount (IDR) |
-| premium_amount | integer | Yes | Gross premium from insurer (IDR) |
+| sum_insured | integer | Yes* | Coverage amount (IDR). *Not required when `coverages` is sent — derived from the items. |
+| premium_amount | integer | Yes* | Gross premium from insurer (IDR). *Not required when `coverages` is sent — derived from the items. |
+| `coverages` | array | No | **[NEW v1.3.0]** Item pertanggungan saved with the policy — same item fields as [`POST /policies/{id}/coverages`](POLICY_COVERAGES_DOCUMENTATION.md#32-post--add-a-coverage-item). Logged only as `policy_created`, never as an endorsement. See [What's New — v1.3.0](#create-policy--inline-coverages-no-endorsement-log). |
 | materai_amount | integer | No | Stamp duty in IDR. Default: `0`. Varies per policy. |
 | biaya_polis | integer | **No** ⭐ NEW | Admin/policy fee in IDR. Default: `0`. Added to customer invoice. |
 | diskon | integer | **No** ⭐ NEW | Discount in IDR. Default: `0`. Deducted from customer invoice. |
@@ -1223,6 +1258,7 @@ Auth required. Commission breakdown is auto-recalculated whenever any financial 
 
 | Field | Type | Description |
 |---|---|---|
+| `policy_number` | string | **[NEW v1.2.0]** Corrected policy number. Unique per company (`409` if taken). Not an endorsement field. |
 | `object_insured` | string | Insured object description |
 | `insured_name` | string\|null | **[NEW v1.1]** "Nama tertanggung" override, or `null` if using the customer's `display_name` |
 | `sum_insured` | int | New TSI in IDR |
@@ -1254,7 +1290,7 @@ Auth required. Commission breakdown is auto-recalculated whenever any financial 
 
 **PATCH** `/api/v1/policies/{policy_id}`
 
-Auth required. Updates policy fields **without** creating an endorsement entry in the audit log. Use this to correct data entry mistakes. Accepts the same fields as `PUT`, including the **[NEW v1.2.0]** `risk_*` fields (see [What's New — v1.2.0](#-whats-new--v120-fe-team-action-required)). Commission breakdown is still recalculated and synced when financial fields are provided.
+Auth required. Updates policy fields **without** creating an endorsement entry in the audit log. Use this to correct data entry mistakes. Accepts the same fields as `PUT`, including the **[NEW v1.2.0]** `policy_number` and `risk_*` fields (see [What's New — v1.2.0](#-whats-new--v120-fe-team-action-required)). Commission breakdown is still recalculated and synced when financial fields are provided.
 
 > **When to use PATCH vs PUT:**
 > - Use `PUT` for formal policy changes (mid-term changes, agreed amendments) — creates an endorsement log.
@@ -1598,9 +1634,9 @@ Auth required. Returns the full chronological event history for a policy — cre
 
 | Value | Triggered by | `old_value` / `new_value` |
 |---|---|---|
-| `policy_created` | `POST /policies` — also auto-creates commission record | — |
+| `policy_created` | `POST /policies` (including any inline `coverages`) — also auto-creates commission record | — |
 | `policy_updated` | `PUT /policies/{id}` (non-financial fields only) | — |
-| `endorsement` | `PUT /policies/{id}` (financial/date fields) or any `coverages` write — also auto-syncs commission | — |
+| `endorsement` | `PUT /policies/{id}` (financial/date fields) or any write to `/policies/{id}/coverages` — also auto-syncs commission. Coverages sent inside `POST /policies` are **not** endorsements. | — |
 | `payment_status_changed` | `PATCH /policies/{id}/payment-status` | e.g. `unpaid` → `paid` |
 | `renewal_status_changed` | `PATCH /policies/{id}/renewal-status` | e.g. `pending` → `renewed` |
 | `followup_logged` | `POST /policies/{id}/follow-ups` | — |

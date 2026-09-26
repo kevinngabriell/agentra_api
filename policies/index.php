@@ -4,6 +4,7 @@ require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
 require_once __DIR__ . '/../helpers/commission.php';
+require_once __DIR__ . '/../helpers/coverage.php';
 require_once __DIR__ . '/export.php';
 
 // Looks up commission rate and tax rate from master_products.
@@ -44,6 +45,32 @@ function resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_
     }
 
     return null;
+}
+
+// [NEW v1.2.0] Validates a policy_number change for PUT/PATCH and returns the trimmed new number.
+// Responds 400 if empty/invalid, or 409 if another policy in the same company already uses it.
+// Skips the duplicate check when the number is unchanged so a full-form resubmit doesn't conflict with itself.
+function validatePolicyNumberChange($conn, $policy_id, $company_id, $raw, $current_number) {
+    if (!is_string($raw) && !is_int($raw)) {
+        jsonResponse(400, 'policy_number must be a non-empty string');
+    }
+    $new_number = trim((string)$raw);
+    if ($new_number === '') {
+        jsonResponse(400, 'policy_number cannot be empty');
+    }
+
+    if ($new_number !== $current_number) {
+        $escaped = mysqli_real_escape_string($conn, $new_number);
+        $dup = mysqli_query($conn,
+            "SELECT 1 FROM " . APP_SCHEMA . ".policies
+             WHERE company_id = '$company_id' AND policy_number = '$escaped' AND policy_id <> '$policy_id' LIMIT 1"
+        );
+        if ($dup && mysqli_num_rows($dup) > 0) {
+            jsonResponse(409, 'Policy number already exists for this company');
+        }
+    }
+
+    return $new_number;
 }
 
 // --- GET ALL (PO-001) ---
@@ -128,7 +155,31 @@ function getAllPolicies($conn, $company_id, $params){
 
 // --- CREATE (PO-002) ---
 function createPolicy($conn, $input, $username, $company_id){
-    $required = ['insurer_id', 'customer_id', 'policy_number', 'product_type', 'coverage_start', 'coverage_end', 'sum_insured', 'premium_amount'];
+    // [NEW v1.3.0] Optional inline item pertanggungan. These are part of the policy as issued, so they are
+    // inserted here and logged only as 'policy_created' — never as endorsements (POST /policies/{id}/coverages
+    // is the post-issuance path and still logs one). All rows are validated before anything is written.
+    $coverage_rows = [];
+    if (isset($input['coverages'])) {
+        if (!is_array($input['coverages'])) {
+            jsonResponse(400, 'coverages must be an array');
+            return;
+        }
+        foreach (array_values($input['coverages']) as $i => $item) {
+            $parsed = is_array($item) ? parseCoverageInput($item) : ['error' => 'must be an object'];
+            if (isset($parsed['error'])) {
+                jsonResponse(400, "coverages[$i]: " . $parsed['error']);
+                return;
+            }
+            $coverage_rows[] = $parsed['row'];
+        }
+    }
+    $has_coverages = !empty($coverage_rows);
+
+    // With a coverage breakdown, sum_insured and premium_amount are derived from it, so they are not required.
+    $required = ['insurer_id', 'customer_id', 'policy_number', 'product_type', 'coverage_start', 'coverage_end'];
+    if (!$has_coverages) {
+        array_push($required, 'sum_insured', 'premium_amount');
+    }
     foreach ($required as $field) {
         if (!isset($input[$field]) || is_string($input[$field]) && trim($input[$field]) === '') {
             jsonResponse(400, "$field is required");
@@ -163,8 +214,14 @@ function createPolicy($conn, $input, $username, $company_id){
         return;
     }
 
-    $sum_insured    = (int)$input['sum_insured'];
-    $premium_amount = (int)$input['premium_amount'];
+    if ($has_coverages) {
+        // Same rule as syncPolicyTotals: only count_in_tsi rows add to TSI, every row adds to premium.
+        $sum_insured    = array_sum(array_column(array_filter($coverage_rows, fn($r) => $r['count_in_tsi'] === 1), 'sum_insured'));
+        $premium_amount = array_sum(array_column($coverage_rows, 'premium_amount'));
+    } else {
+        $sum_insured    = (int)$input['sum_insured'];
+        $premium_amount = (int)$input['premium_amount'];
+    }
 
     // Always resolve master product to get both commission rate and default tax rate.
     $resolved = resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number);
@@ -327,12 +384,32 @@ function createPolicy($conn, $input, $username, $company_id){
          $commission_tax_rate, $commission_tax_amount, $net_commission_amount, $customer_premium_amount,
          $is_coassurance, $notes, '$username', '$now')";
 
+    // Policy + its coverage rows are one unit: a failed coverage insert must not leave a policy with wrong totals.
+    if ($has_coverages) {
+        mysqli_begin_transaction($conn);
+    }
+
     if (mysqli_query($conn, $sql)) {
+        foreach ($coverage_rows as $row) {
+            if (insertCoverageRow($conn, $policy_id, $row, $username, $now) === null) {
+                $error = mysqli_error($conn);
+                mysqli_rollback($conn);
+                jsonResponse(500, 'Failed to create policy coverages', ['error' => $error]);
+                return;
+            }
+        }
         insertCommission($conn, $policy_id, $company_id, $insurer_id, $premium_amount, $commission_rate, $commission_amount, $issuing_agent_id !== 'NULL' ? $input['issuing_agent_id'] ?? null : null, $commission_tax_rate);
         insertPolicyLog($conn, $policy_id, $company_id, 'policy_created', 'Polis dibuat', $username);
+        if ($has_coverages) {
+            mysqli_commit($conn);
+        }
         jsonResponse(201, 'Policy created successfully', ['policy_id' => $policy_id]);
     } else {
-        jsonResponse(500, 'Failed to create policy', ['error' => mysqli_error($conn)]);
+        $error = mysqli_error($conn);
+        if ($has_coverages) {
+            mysqli_rollback($conn);
+        }
+        jsonResponse(500, 'Failed to create policy', ['error' => $error]);
     }
 }
 
@@ -401,7 +478,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
     $check = mysqli_query($conn,
-        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
+        "SELECT policy_number, premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
                 object_insured, insured_name, sum_insured, coverage_notes, construction_class,
                 risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
                 coverage_start, coverage_end, notes
@@ -414,6 +491,16 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
 
     $updates = [];
 
+    // [NEW v1.2.0] policy_number: correctable if entered wrong. Unique per company; unchanged values are dropped so they don't reach the audit log.
+    if (isset($input['policy_number'])) {
+        $new_policy_number = validatePolicyNumberChange($conn, $policy_id, $company_id, $input['policy_number'], $current['policy_number']);
+        if ($new_policy_number !== $current['policy_number']) {
+            $updates[] = "policy_number = '" . mysqli_real_escape_string($conn, $new_policy_number) . "'";
+            $input['policy_number'] = $new_policy_number;
+        } else {
+            unset($input['policy_number']);
+        }
+    }
     if (isset($input['object_insured'])) {
         $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
         $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
@@ -576,6 +663,7 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         $before = [];
         $after  = [];
         $label_map = [
+            'policy_number'       => 'nomor polis',
             'object_insured'      => 'objek pertanggungan',
             'insured_name'        => 'nama tertanggung',
             'sum_insured'         => 'uang pertanggungan',
@@ -636,7 +724,7 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
     $check = mysqli_query($conn,
-        "SELECT premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
+        "SELECT policy_number, premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
                 object_insured, insured_name, sum_insured, coverage_notes, construction_class,
                 risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
                 coverage_start, coverage_end, notes
@@ -649,6 +737,16 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
 
     $updates = [];
 
+    // [NEW v1.2.0] policy_number: correctable if entered wrong. Unique per company; unchanged values are dropped so they don't reach the audit log.
+    if (isset($input['policy_number'])) {
+        $new_policy_number = validatePolicyNumberChange($conn, $policy_id, $company_id, $input['policy_number'], $current['policy_number']);
+        if ($new_policy_number !== $current['policy_number']) {
+            $updates[] = "policy_number = '" . mysqli_real_escape_string($conn, $new_policy_number) . "'";
+            $input['policy_number'] = $new_policy_number;
+        } else {
+            unset($input['policy_number']);
+        }
+    }
     if (isset($input['object_insured'])) {
         $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
         $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
@@ -803,6 +901,7 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
 
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policies SET " . implode(', ', $updates) . " WHERE policy_id = '$policy_id' AND company_id = '$company_id'")) {
         $label_map = [
+            'policy_number'       => 'nomor polis',
             'object_insured'      => 'objek pertanggungan',
             'insured_name'        => 'nama tertanggung',
             'sum_insured'         => 'uang pertanggungan',

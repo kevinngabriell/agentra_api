@@ -3,8 +3,7 @@
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
-
-const COVERAGE_TYPES = ['bangunan', 'stok', 'invenisi', 'mesin', 'dll'];
+require_once __DIR__ . '/../helpers/coverage.php';
 
 // Recomputes sum_insured, premium_amount, and commission_amount on the parent policy from its coverages.
 // Only rows with count_in_tsi=1 contribute to sum_insured (so duplicate clauses on the same object don't inflate TSI).
@@ -87,58 +86,27 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
         return;
     }
 
-    foreach (['coverage_type', 'sum_insured', 'rate_permille'] as $field) {
-        if (!isset($input[$field]) || $input[$field] === '') {
-            jsonResponse(400, "$field is required");
-            return;
-        }
-    }
-
-    $coverage_type  = strtolower(trim(mysqli_real_escape_string($conn, $input['coverage_type'])));
-    $coverage_label = isset($input['coverage_label']) && trim($input['coverage_label']) !== ''
-        ? "'" . mysqli_real_escape_string($conn, trim($input['coverage_label'])) . "'"
-        : 'NULL';
-
-    if (!in_array($coverage_type, COVERAGE_TYPES, true)) {
-        jsonResponse(400, 'coverage_type must be one of: ' . implode(', ', COVERAGE_TYPES));
+    $parsed = parseCoverageInput($input);
+    if (isset($parsed['error'])) {
+        jsonResponse(400, $parsed['error']);
         return;
     }
+    $row = $parsed['row'];
 
-    $sum_insured   = (int)$input['sum_insured'];
-    $rate_permille = $input['rate_permille'];
-    // count_in_tsi=false lets agents add extra clauses (RSMD, OTHERS) on the same object
-    // without inflating the policy TSI — premium still calculated on the full sum_insured.
-    $count_in_tsi  = isset($input['count_in_tsi']) ? ($input['count_in_tsi'] ? 1 : 0) : 1;
+    $coverage_id = insertCoverageRow($conn, $policy_id, $row, $username, date('Y-m-d H:i:s'));
 
-    if ($sum_insured < 0) {
-        jsonResponse(400, 'sum_insured must be a non-negative integer');
-        return;
-    }
-    if (!is_numeric($rate_permille) || $rate_permille < 0) {
-        jsonResponse(400, 'rate_permille must be a non-negative number');
-        return;
-    }
-
-    $rate_permille  = number_format((float)$rate_permille, 4, '.', '');
-    $premium_amount = (int)round($sum_insured * (float)$rate_permille / 1000);
-    $coverage_id    = 'cov_' . uniqid();
-    $now            = date('Y-m-d H:i:s');
-
-    $sql = "INSERT INTO " . APP_SCHEMA . ".policy_coverages
-                (coverage_id, policy_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, created_by, created_at)
-            VALUES ('$coverage_id', '$policy_id', '$coverage_type', $coverage_label, $sum_insured, $rate_permille, $premium_amount, $count_in_tsi, '$username', '$now')";
-
-    if (mysqli_query($conn, $sql)) {
+    if ($coverage_id !== null) {
         syncPolicyTotals($conn, $policy_id);
-        $label_text = isset($input['coverage_label']) && trim($input['coverage_label']) !== ''
-            ? ' (' . trim($input['coverage_label']) . ')' : '';
+        $label_text = $row['coverage_label'] !== null ? " ({$row['coverage_label']})" : '';
+        // The policy already exists here, so this is a change after issuance → endorsement.
+        // Coverages supplied in POST /policies are inserted there and never reach this log.
         insertPolicyLog($conn, $policy_id, $company_id, 'endorsement',
-            "Endorsemen: item pertanggungan ditambahkan — {$coverage_type}{$label_text}", $username,
+            "Endorsemen: item pertanggungan ditambahkan — {$row['coverage_type']}{$label_text}", $username,
             null, null, 'policy_coverages', $coverage_id,
-            ['coverage_type' => $coverage_type, 'sum_insured' => $sum_insured,
-             'rate_permille' => (float)$rate_permille, 'premium_amount' => $premium_amount,
-             'count_in_tsi' => (bool)$count_in_tsi]);
-        jsonResponse(201, 'Coverage item added', ['coverage_id' => $coverage_id, 'premium_amount' => $premium_amount]);
+            ['coverage_type' => $row['coverage_type'], 'sum_insured' => $row['sum_insured'],
+             'rate_permille' => (float)$row['rate_permille'], 'premium_amount' => $row['premium_amount'],
+             'count_in_tsi' => (bool)$row['count_in_tsi']]);
+        jsonResponse(201, 'Coverage item added', ['coverage_id' => $coverage_id, 'premium_amount' => $row['premium_amount']]);
     } else {
         jsonResponse(500, 'Failed to add coverage', ['error' => mysqli_error($conn)]);
     }
