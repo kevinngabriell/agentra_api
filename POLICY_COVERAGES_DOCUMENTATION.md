@@ -132,6 +132,8 @@ GET /api/v1/policies/{policy_id}/coverages
 POST /api/v1/policies/{policy_id}/coverages
 ```
 
+> **This is an endorsement.** It is for adding an item to a policy that already exists, and it is written to the policy audit log as `endorsement`. When you are *creating* a policy, do not call this endpoint once per item — send them as `coverages` in `POST /policies` instead (see [3.6](#36-creating-a-policy-with-its-coverage-items-no-endorsement)).
+
 **Request Body:**
 ```json
 {
@@ -235,6 +237,38 @@ No body needed.
 
 ---
 
+### 3.6 Creating a policy with its coverage items (no endorsement)
+
+Coverage items entered while creating a policy are part of the policy as issued — they are **not** an endorsement (an endorsement is a change made *after* the policy exists). Send them inline:
+
+```
+POST /api/v1/policies
+```
+
+```json
+{
+  "insurer_id": "ins_xxx",
+  "customer_id": "cst_xxx",
+  "policy_number": "FR-001",
+  "product_type": "fire",
+  "coverage_start": "2026-01-01",
+  "coverage_end": "2027-01-01",
+  "coverages": [
+    { "coverage_type": "bangunan", "coverage_label": "Bangunan Utama", "sum_insured": 500000000, "rate_permille": 0.328 },
+    { "coverage_type": "stok",     "coverage_label": "Stok 1",         "sum_insured": 200000000, "rate_permille": 2.28 }
+  ]
+}
+```
+
+Each item takes the same fields as [3.2](#32-post--add-a-coverage-item) (`coverage_type`, `sum_insured`, `rate_permille` required; `coverage_label`, `count_in_tsi` optional).
+
+- **`sum_insured` and `premium_amount` become optional** on the policy when `coverages` is sent — both are derived from the items (TSI counts `count_in_tsi` rows only; premium counts every row), and commission is computed from the derived premium. If you still send them they are ignored.
+- **Audit log:** only a single `policy_created` entry is written. No `endorsement` entries are created for the items.
+- **All-or-nothing:** every item is validated before anything is saved (`400` with `coverages[<index>]: <reason>` on the first bad item), and the policy and its items are saved in one transaction.
+- Omit `coverages` (or send `[]`) to keep the old behaviour — the policy is created with the scalar `sum_insured` / `premium_amount` you send.
+
+---
+
 ## 4. Spreadsheet → API mapping
 
 How to translate one spreadsheet row into API calls.
@@ -248,7 +282,7 @@ This means:
 - Stok category with rate `2.28‰` for one sum insured component
 - Another category with rate `0.5‰`
 
-**You send two POST requests:**
+**For an existing policy, you send two POST requests (each is logged as an endorsement).** When creating a new policy, put the same two objects in the `coverages` array of `POST /policies` instead — see [3.6](#36-creating-a-policy-with-its-coverage-items-no-endorsement).
 
 ```json
 POST /api/v1/policies/pol_xxx/coverages
@@ -450,3 +484,4 @@ async function reloadCoverages() {
 5. **Multiple clauses on the same object** (e.g. Building FLEXAS + Building RSMD + Building OTHERS all at 750 JT) — set `count_in_tsi: false` on the 2nd and 3rd rows. All three premiums are still calculated correctly; only the first row's 750 JT is added to TSI so the policy doesn't show 2.25B instead of 750M.
 6. **Deleting all coverage items** sets the policy totals to 0, it does not delete the policy itself.
 7. **Deleting a policy** (`ON DELETE CASCADE`) automatically removes all its coverage items.
+8. **Endorsement vs. creation:** coverage items sent in `POST /policies` are part of the policy as issued and are not logged as endorsements. Any add/update/delete through `/policies/{id}/coverages` happens after the policy exists and is always logged as an `endorsement`.
