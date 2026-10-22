@@ -1,3 +1,6 @@
 .env
 vendor/
 *.log
+.history
+*.sql
+agentra_[0-9]*

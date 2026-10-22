@@ -3,7 +3,7 @@ name: Deploy Agentra API
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   deploy-agentra-api:
@@ -24,6 +24,7 @@ jobs:
           rsync -a --delete \
             --exclude=".git" \
             --exclude=".github" \
+            --exclude=".env" \
             ./ "$APP_DIR"/
 
       - name: Start / Restart Agentra API with PM2

@@ -1,0 +1,1250 @@
+{
+	"info": {
+		"name": "Agentra API",
+		"_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		"description": "# Agentra API — Postman Collection\n\nInsurance broker management API for Agentra.\n\n- **Base URL:** `{{base_url}}/api/v1`\n- **Auth:** JWT Bearer Token (`Authorization: Bearer {{access_token}}`)\n- **Content-Type:** `application/json`\n- **Response envelope:** `{ status_code, status_message, data }`\n\n## Getting Started\n\n1. Set the `base_url` variable in your environment (e.g. `http://localhost/agentra_api`)\n2. Call **Login** — the test script auto-saves `access_token` and `refresh_token` to environment variables.\n3. All subsequent requests use `Bearer {{access_token}}` automatically.\n\n## Recommended Testing Order\n\n1. Register → POST /auth/register\n2. Login → POST /auth/login *(saves tokens)*\n3. Get Plans → GET /plans?app_id=...\n4. Create Insurer → POST /insurers\n5. Create Customer → POST /customers\n6. Create Policy → POST /policies\n7. Add Coverages → POST /policies/{id}/coverages\n8. Follow-up → POST /policies/{id}/follow-ups\n9. Update Statuses → PATCH /policies/{id}/payment-status, /renewal-status\n10. View Commission → GET /policies/{id}/commission\n11. View History → GET /policies/{id}/logs\n12. Commission List → GET /commissions\n13. Commission Stats → GET /commissions/summary\n14. Mark Received → PATCH /commissions/{id}/mark-received\n15. Correct Policy → PATCH /policies/{id}\n16. Delete Policy → DELETE /policies/{id}\n17. Export → GET /policies/export?month=YYYY-MM",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{ "key": "token", "value": "{{access_token}}", "type": "string" }
+		]
+	},
+
+	"variable": [
+		{ "key": "base_url", "value": "http://localhost/agentra_api" },
+		{ "key": "api_prefix", "value": "/api/v1" },
+		{ "key": "access_token", "value": "" },
+		{ "key": "refresh_token", "value": "" },
+		{ "key": "app_id", "value": "7c2e6a2f-b254-4bbb-87f2-c6ece0f88db2" },
+		{ "key": "customer_id", "value": "" },
+		{ "key": "insurer_id", "value": "" },
+		{ "key": "policy_id", "value": "" },
+		{ "key": "commission_id", "value": "" },
+		{ "key": "coverage_id", "value": "" },
+		{ "key": "coassurance_id", "value": "" },
+		{ "key": "product_id", "value": "" },
+		{ "key": "plan_id", "value": "" }
+	],
+
+	"item": [
+		{
+			"name": "Auth",
+			"description": "Authentication endpoints — register, login, SSO, refresh, logout, password reset.",
+			"item": [
+				{
+					"name": "Register",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/register", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "register"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"John Doe\",\n  \"email\": \"john@example.com\",\n  \"password\": \"secret1234\",\n  \"password_confirmation\": \"secret1234\",\n  \"phone\": \"081234567890\",\n  \"business_name\": \"PT Asuransi Maju\",\n  \"city\": \"Jakarta\",\n  \"plan\": \"{{plan_id}}\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.access_token) {",
+									"    pm.environment.set('access_token', json.data.access_token);",
+									"    pm.environment.set('refresh_token', json.data.refresh_token);",
+									"    console.log('Tokens saved to environment variables');",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/login", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "login"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"john@example.com\",\n  \"password\": \"secret1234\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "SSO Login",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/sso", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "sso"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"assertion\": \"<assertion_token_from_movira_core>\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Refresh Token",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.access_token) {",
+									"    pm.environment.set('access_token', json.data.access_token);",
+									"    pm.environment.set('refresh_token', json.data.refresh_token);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/refresh", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "refresh"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Logout",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/logout", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "logout"] },
+						"body": { "mode": "raw", "raw": "{}" }
+					},
+					"response": []
+				},
+				{
+					"name": "Forgot Password",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/forgot-password", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "forgot-password"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"john@example.com\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Reset Password",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/auth/reset-password", "host": ["{{base_url}}"], "path": ["api", "v1", "auth", "reset-password"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"john@example.com\",\n  \"token\": \"<reset_code_from_whatsapp>\",\n  \"password\": \"newsecret1234\",\n  \"password_confirmation\": \"newsecret1234\"\n}"
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Users",
+			"description": "User profile and account management endpoints.",
+			"item": [
+				{
+					"name": "Get My Profile",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/users/me", "host": ["{{base_url}}"], "path": ["api", "v1", "users", "me"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update My Profile",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/users/me", "host": ["{{base_url}}"], "path": ["api", "v1", "users", "me"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"first_name\": \"John Updated\",\n  \"phone_number\": \"089876543210\",\n  \"language\": \"id\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Change Password",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/users/me/password", "host": ["{{base_url}}"], "path": ["api", "v1", "users", "me", "password"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"current_password\": \"secret1234\",\n  \"new_password\": \"newsecret1234\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Notification Settings",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/users/me/notification-settings", "host": ["{{base_url}}"], "path": ["api", "v1", "users", "me", "notification-settings"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update Notification Settings",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/users/me/notification-settings", "host": ["{{base_url}}"], "path": ["api", "v1", "users", "me", "notification-settings"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"whatsapp_target_number\": \"6281234567890\",\n  \"daily_digest_enabled\": true,\n  \"daily_digest_time\": \"08:00:00\",\n  \"daily_days_of_week\": \"1,2,3,4,5\",\n  \"monthly_digest_enabled\": true,\n  \"monthly_digest_day\": 1,\n  \"monthly_digest_time\": \"08:00:00\",\n  \"renewal_reminder_days\": 30,\n  \"renewal_wa_message_template\": \"Halo {customer_name}, polis {policy_number} ({product_type}) bersama {insurer_name} akan berakhir pada {coverage_end} ({days_until_expiry} hari lagi). Mohon hubungi kami untuk perpanjangan.\"\n}"
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Plans",
+			"description": "Subscription plan catalog.",
+			"item": [
+				{
+					"name": "Get All Plans",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/plans?app_id={{app_id}}",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "plans"],
+							"query": [{ "key": "app_id", "value": "{{app_id}}" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Plan Detail",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/plans/{{plan_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "plans", "{{plan_id}}"] }
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Subscription",
+			"description": "Active subscription management.",
+			"item": [
+				{
+					"name": "Get Current Subscription",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/subscription/current", "host": ["{{base_url}}"], "path": ["api", "v1", "subscription", "current"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Change Plan",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/subscription/change-plan", "host": ["{{base_url}}"], "path": ["api", "v1", "subscription", "change-plan"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"new_plan_id\": \"{{plan_id}}\",\n  \"billing_cycle\": \"monthly\"\n}"
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Dashboard",
+			"description": "Dashboard statistics and activity feeds.",
+			"item": [
+				{
+					"name": "Get Dashboard Stats",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/dashboard/stats", "host": ["{{base_url}}"], "path": ["api", "v1", "dashboard", "stats"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Get Dashboard Activity",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/dashboard/activity?limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "dashboard", "activity"],
+							"query": [{ "key": "limit", "value": "15" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Today Actions",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/dashboard/today-actions?limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "dashboard", "today-actions"],
+							"query": [{ "key": "limit", "value": "15" }]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Customers",
+			"description": "Customer CRUD, import/export, and linked policies.",
+			"item": [
+				{
+					"name": "Get All Customers",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/customers?params=&customer_type=&status=&page=1&limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "customers"],
+							"query": [
+								{ "key": "params", "value": "" },
+								{ "key": "customer_type", "value": "" },
+								{ "key": "status", "value": "" },
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Customer (Individual)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.customer_id) {",
+									"    pm.environment.set('customer_id', json.data.customer_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/customers", "host": ["{{base_url}}"], "path": ["api", "v1", "customers"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"customer_type\": \"individual\",\n  \"display_name\": \"Budi Santoso\",\n  \"nik\": \"1234567890123456\",\n  \"date_of_birth\": \"1990-01-15\",\n  \"personal_phone\": \"081234567890\",\n  \"personal_whatsapp\": \"081234567890\",\n  \"personal_email\": \"budi@example.com\",\n  \"personal_address\": \"Jl. Merdeka No. 10, Jakarta\",\n  \"status\": \"active\",\n  \"source\": \"direct\",\n  \"notes\": \"\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Customer (Company)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/customers", "host": ["{{base_url}}"], "path": ["api", "v1", "customers"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"customer_type\": \"company\",\n  \"display_name\": \"PT Maju Jaya\",\n  \"company_legal_name\": \"PT Maju Jaya Bersama\",\n  \"npwp_company\": \"01.234.567.8-901.000\",\n  \"business_type\": \"Manufacturing\",\n  \"nib\": \"1234567890123\",\n  \"operational_address\": \"Jl. Industri No. 5, Jakarta\",\n  \"legal_address\": \"Jl. Sudirman No. 1, Jakarta\",\n  \"company_phone\": \"0215551234\",\n  \"company_email\": \"info@majujaya.co.id\",\n  \"pic_name\": \"Andi Wijaya\",\n  \"pic_role\": \"Procurement Manager\",\n  \"pic_phone\": \"081234567890\",\n  \"pic_whatsapp\": \"081234567890\",\n  \"pic_email\": \"andi@majujaya.co.id\",\n  \"status\": \"active\",\n  \"source\": \"direct\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Export Customers to Excel",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/customers/export?params=&customer_type=&status=",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "customers", "export"],
+							"query": [
+								{ "key": "params", "value": "" },
+								{ "key": "customer_type", "value": "" },
+								{ "key": "status", "value": "" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Import Customers (CSV)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/customers/import", "host": ["{{base_url}}"], "path": ["api", "v1", "customers", "import"] },
+						"body": {
+							"mode": "formdata",
+							"formdata": [{ "key": "file", "type": "file", "src": "" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Customer Detail",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/customers/{{customer_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "customers", "{{customer_id}}"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update Customer",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/customers/{{customer_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "customers", "{{customer_id}}"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"display_name\": \"Budi Santoso Updated\",\n  \"personal_phone\": \"089876543210\",\n  \"notes\": \"Updated notes\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Update Customer Status",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/customers/{{customer_id}}/status", "host": ["{{base_url}}"], "path": ["api", "v1", "customers", "{{customer_id}}", "status"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"status\": \"inactive\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Customer Follow-ups",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/customers/{{customer_id}}/follow-ups?page=1&limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "customers", "{{customer_id}}", "follow-ups"],
+							"query": [
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Customer Policies",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/customers/{{customer_id}}/policies?page=1&limit=15&renewal_status=",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "customers", "{{customer_id}}", "policies"],
+							"query": [
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" },
+								{ "key": "renewal_status", "value": "" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Customer",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/customers/{{customer_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "customers", "{{customer_id}}"] }
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Insurers",
+			"description": "Insurance company / underwriter management.",
+			"item": [
+				{
+					"name": "Get All Insurers",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/insurers?is_active=true",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "insurers"],
+							"query": [{ "key": "is_active", "value": "true" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Insurer",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.insurer_id) {",
+									"    pm.environment.set('insurer_id', json.data.insurer_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/insurers", "host": ["{{base_url}}"], "path": ["api", "v1", "insurers"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"PT Asuransi Allianz\",\n  \"short_name\": \"ALLIANZ\",\n  \"agent_code\": \"AG001\",\n  \"is_primary\": true,\n  \"notes\": \"Primary insurer\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Insurer Detail",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/insurers/{{insurer_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "insurers", "{{insurer_id}}"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update Insurer",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/insurers/{{insurer_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "insurers", "{{insurer_id}}"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"PT Asuransi Allianz Updated\",\n  \"agent_code\": \"AG002\",\n  \"notes\": \"Updated notes\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Deactivate Insurer (Soft Delete)",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/insurers/{{insurer_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "insurers", "{{insurer_id}}"] }
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Master Products",
+			"description": "Product type catalog with commission rates and tax defaults.",
+			"item": [
+				{
+					"name": "Get All Master Products",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/master-products", "host": ["{{base_url}}"], "path": ["api", "v1", "master-products"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Create Master Product",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.product_id) {",
+									"    pm.environment.set('product_id', json.data.product_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/master-products", "host": ["{{base_url}}"], "path": ["api", "v1", "master-products"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"product_code\": \"fire\",\n  \"product_name\": \"Fire Insurance\",\n  \"commission_rate\": 15.50,\n  \"default_tax_rate\": 0.025,\n  \"policy_prefixes\": \"FR,FI\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Master Product Detail",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/master-products/{{product_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "master-products", "{{product_id}}"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update Master Product",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/master-products/{{product_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "master-products", "{{product_id}}"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"product_name\": \"Fire Insurance Updated\",\n  \"commission_rate\": 16.00,\n  \"default_tax_rate\": 0.025,\n  \"is_active\": true\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Master Product",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/master-products/{{product_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "master-products", "{{product_id}}"] }
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Master Wilayah",
+			"description": "Indonesian administrative region lookup — cascading Province → City → District → Village.",
+			"item": [
+				{
+					"name": "Get Provinces",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/master-wilayah/provinces", "host": ["{{base_url}}"], "path": ["api", "v1", "master-wilayah", "provinces"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Get Cities by Province",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/master-wilayah/cities?province_code=11",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "master-wilayah", "cities"],
+							"query": [{ "key": "province_code", "value": "11" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Districts by City",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/master-wilayah/districts?city_code=11.01",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "master-wilayah", "districts"],
+							"query": [{ "key": "city_code", "value": "11.01" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Villages by District",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/master-wilayah/villages?district_code=11.01.01",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "master-wilayah", "villages"],
+							"query": [{ "key": "district_code", "value": "11.01.01" }]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Policies",
+			"description": "Policy CRUD, coverages, co-assurance, renewals, follow-ups, commission, logs, export.\n\n**PUT** = update with endorsement log | **PATCH** = direct update without endorsement (corrections)",
+			"item": [
+				{
+					"name": "Get All Policies",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/policies?search=&customer_id=&product_type=&insurer_id=&renewal_status=&expiry_month=&agent_id=&page=1&limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "policies"],
+							"query": [
+								{ "key": "search", "value": "" },
+								{ "key": "customer_id", "value": "" },
+								{ "key": "product_type", "value": "" },
+								{ "key": "insurer_id", "value": "" },
+								{ "key": "renewal_status", "value": "" },
+								{ "key": "expiry_month", "value": "" },
+								{ "key": "agent_id", "value": "" },
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Policy",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.policy_id) {",
+									"    pm.environment.set('policy_id', json.data.policy_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies", "host": ["{{base_url}}"], "path": ["api", "v1", "policies"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"insurer_id\": \"{{insurer_id}}\",\n  \"customer_id\": \"{{customer_id}}\",\n  \"policy_number\": \"FR-001\",\n  \"product_type\": \"fire\",\n  \"coverage_start\": \"2026-01-01\",\n  \"coverage_end\": \"2027-01-01\",\n  \"sum_insured\": 500000000,\n  \"premium_amount\": 1640000,\n  \"commission_rate\": 15.50,\n  \"commission_tax_rate\": 0.025,\n  \"materai_amount\": 10000,\n  \"biaya_polis\": 50000,\n  \"diskon\": 0,\n  \"object_insured\": \"Gudang, Jl. Industri No. 5\",\n  \"insured_name\": \"PT Maju Jaya\",\n  \"construction_class\": \"I\",\n  \"risk_address\": \"Jl. Industri No. 5\",\n  \"risk_village\": \"Kelurahan Industri\",\n  \"risk_district\": \"Kecamatan Industri\",\n  \"risk_city\": \"Jakarta Utara\",\n  \"risk_province\": \"DKI Jakarta\",\n  \"risk_postal_code\": \"14250\",\n  \"risk_latitude\": -6.123456,\n  \"risk_longitude\": 106.987654,\n  \"notes\": \"\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Policy with Inline Coverages",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"var json = pm.response.json();",
+									"if (json.data && json.data.policy_id) {",
+									"    pm.environment.set('policy_id', json.data.policy_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies", "host": ["{{base_url}}"], "path": ["api", "v1", "policies"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"insurer_id\": \"{{insurer_id}}\",\n  \"customer_id\": \"{{customer_id}}\",\n  \"policy_number\": \"FR-002\",\n  \"product_type\": \"fire\",\n  \"coverage_start\": \"2026-01-01\",\n  \"coverage_end\": \"2027-01-01\",\n  \"coverages\": [\n    {\n      \"coverage_type\": \"bangunan\",\n      \"coverage_label\": \"Bangunan Utama\",\n      \"sum_insured\": 500000000,\n      \"rate_permille\": 0.328,\n      \"count_in_tsi\": true\n    },\n    {\n      \"coverage_type\": \"stok\",\n      \"coverage_label\": \"Stok Barang\",\n      \"sum_insured\": 200000000,\n      \"rate_permille\": 2.28,\n      \"count_in_tsi\": true\n    }\n  ],\n  \"construction_class\": \"I\",\n  \"object_insured\": \"Gudang\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Export Policies to Excel",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/policies/export?month=2026-06",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "policies", "export"],
+							"query": [
+								{ "key": "month", "value": "2026-06" },
+								{ "key": "insurer_id", "value": "", "disabled": true },
+								{ "key": "product_type", "value": "", "disabled": true },
+								{ "key": "renewal_status", "value": "", "disabled": true }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Payment Summary",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/policies/payment-summary?insurer_id={{insurer_id}}&month=&payment_status=all",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "policies", "payment-summary"],
+							"query": [
+								{ "key": "insurer_id", "value": "{{insurer_id}}" },
+								{ "key": "month", "value": "" },
+								{ "key": "payment_status", "value": "all" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Policy Detail",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update Policy (Endorsement)",
+					"request": {
+						"method": "PUT",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"sum_insured\": 600000000,\n  \"premium_amount\": 1800000,\n  \"commission_rate\": 16.00,\n  \"coverage_end\": \"2027-01-15\",\n  \"materai_amount\": 10000,\n  \"notes\": \"Endorsement: increased sum insured\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Direct Update Policy (No Endorsement)",
+					"request": {
+						"method": "PATCH",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"policy_number\": \"FR-001-CORRECTED\",\n  \"notes\": \"Corrected policy number typo\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Policy",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Update Renewal Status",
+					"request": {
+						"method": "PATCH",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/renewal-status", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "renewal-status"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"renewal_status\": \"pending\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Add Follow-up",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/follow-ups", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "follow-ups"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"follow_up_date\": \"2026-06-15\",\n  \"followup_status\": \"contacted\",\n  \"channel\": \"whatsapp\",\n  \"notes\": \"Customer confirmed interest in renewal\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Update Payment Status",
+					"request": {
+						"method": "PATCH",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/payment-status", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "payment-status"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"payment_status\": \"paid\"\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Commission for Policy",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/commission", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "commission"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Get Policy Logs",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/policies/{{policy_id}}/logs?page=1&limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "policies", "{{policy_id}}", "logs"],
+							"query": [
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Renew Policy",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/renew", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "renew"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"policy_number\": \"FR-003\",\n  \"coverage_start\": \"2027-01-02\",\n  \"coverage_end\": \"2028-01-02\",\n  \"commission_rate\": 16.00\n}"
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Coverages",
+					"description": "Policy coverage items (area pertanggungan).",
+					"item": [
+						{
+							"name": "Get All Coverages",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coverages", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coverages"] }
+							},
+							"response": []
+						},
+						{
+							"name": "Add Coverage Item",
+							"event": [
+								{
+									"listen": "test",
+									"script": {
+										"type": "text/javascript",
+										"exec": [
+											"var json = pm.response.json();",
+											"if (json.data && json.data.coverage_id) {",
+											"    pm.environment.set('coverage_id', json.data.coverage_id);",
+											"}"
+										]
+									}
+								}
+							],
+							"request": {
+								"method": "POST",
+								"header": [{ "key": "Content-Type", "value": "application/json" }],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coverages", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coverages"] },
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"coverage_type\": \"bangunan\",\n  \"coverage_label\": \"Bangunan Utama\",\n  \"sum_insured\": 500000000,\n  \"rate_permille\": 0.328,\n  \"count_in_tsi\": true\n}"
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "Update Coverage Item",
+							"request": {
+								"method": "PUT",
+								"header": [{ "key": "Content-Type", "value": "application/json" }],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coverages/{{coverage_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coverages", "{{coverage_id}}"] },
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"sum_insured\": 550000000,\n  \"rate_permille\": 0.35,\n  \"count_in_tsi\": true\n}"
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Coverage Item",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coverages/{{coverage_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coverages", "{{coverage_id}}"] }
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Co-assurance",
+					"description": "Co-insurance participants for a policy.",
+					"item": [
+						{
+							"name": "List Co-assurance Participants",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coassurance", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coassurance"] }
+							},
+							"response": []
+						},
+						{
+							"name": "Add Co-assurance Participant",
+							"event": [
+								{
+									"listen": "test",
+									"script": {
+										"type": "text/javascript",
+										"exec": [
+											"var json = pm.response.json();",
+											"if (json.data && json.data.coassurance_id) {",
+											"    pm.environment.set('coassurance_id', json.data.coassurance_id);",
+											"}"
+										]
+									}
+								}
+							],
+							"request": {
+								"method": "POST",
+								"header": [{ "key": "Content-Type", "value": "application/json" }],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coassurance", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coassurance"] },
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"co_insurer_name\": \"PT Asuransi Sinarmas\",\n  \"co_insurer_id\": \"\",\n  \"share_percent\": 30,\n  \"is_leader\": false,\n  \"sum_insured_share\": 150000000,\n  \"premium_share\": 492000,\n  \"commission_rate\": 15.00,\n  \"notes\": \"Co-insurer 30% share\"\n}"
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "Update Co-assurance Participant",
+							"request": {
+								"method": "PUT",
+								"header": [{ "key": "Content-Type", "value": "application/json" }],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coassurance/{{coassurance_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coassurance", "{{coassurance_id}}"] },
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"share_percent\": 35,\n  \"premium_share\": 574000,\n  \"is_leader\": true,\n  \"notes\": \"Updated to leader\"\n}"
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "Remove Co-assurance Participant",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": { "raw": "{{base_url}}/api/v1/policies/{{policy_id}}/coassurance/{{coassurance_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "policies", "{{policy_id}}", "coassurance", "{{coassurance_id}}"] }
+							},
+							"response": []
+						}
+					]
+				}
+			]
+		},
+
+		{
+			"name": "Renewals",
+			"description": "Renewal tracking, stats, and WhatsApp follow-up.",
+			"item": [
+				{
+					"name": "Get Renewal List",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/renewals?month=2026-06&renewal_status=&page=1&limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "renewals"],
+							"query": [
+								{ "key": "month", "value": "2026-06" },
+								{ "key": "renewal_status", "value": "" },
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Renewal Stats",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/renewals/stats?month=2026-06",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "renewals", "stats"],
+							"query": [{ "key": "month", "value": "2026-06" }]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Send Renewal WhatsApp",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/renewals/{{policy_id}}/send-whatsapp", "host": ["{{base_url}}"], "path": ["api", "v1", "renewals", "{{policy_id}}", "send-whatsapp"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"message\": \"\"\n}"
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Commissions",
+			"description": "Commission records, summary stats, and mark-received.",
+			"item": [
+				{
+					"name": "Get All Commissions",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/commissions?insurer_id=&status=&commission_type=&month=&page=1&limit=15",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "commissions"],
+							"query": [
+								{ "key": "insurer_id", "value": "" },
+								{ "key": "status", "value": "" },
+								{ "key": "commission_type", "value": "" },
+								{ "key": "month", "value": "" },
+								{ "key": "page", "value": "1" },
+								{ "key": "limit", "value": "15" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Commission Summary",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/commissions/summary?insurer_id=&month=",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "commissions", "summary"],
+							"query": [
+								{ "key": "insurer_id", "value": "" },
+								{ "key": "month", "value": "" }
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Commission Detail",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{base_url}}/api/v1/commissions/{{commission_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "commissions", "{{commission_id}}"] }
+					},
+					"response": []
+				},
+				{
+					"name": "Mark Commission Received",
+					"request": {
+						"method": "PATCH",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/commissions/{{commission_id}}/mark-received", "host": ["{{base_url}}"], "path": ["api", "v1", "commissions", "{{commission_id}}", "mark-received"] },
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"received_amount\": 252000,\n  \"received_date\": \"2026-06-20\",\n  \"reference_number\": \"BANK-REF-001\",\n  \"discrepancy_notes\": \"\"\n}"
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Revenue",
+			"description": "Production report by week/month and per-agent breakdown.",
+			"item": [
+				{
+					"name": "Get Revenue Summary",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/v1/revenue/summary?month=2026-06",
+							"host": ["{{base_url}}"],
+							"path": ["api", "v1", "revenue", "summary"],
+							"query": [{ "key": "month", "value": "2026-06" }]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+
+		{
+			"name": "Services",
+			"description": "System/cron service endpoints.",
+			"item": [
+				{
+					"name": "Send Renewal Reminder (Cron)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": { "raw": "{{base_url}}/api/v1/services/renewal-reminder", "host": ["{{base_url}}"], "path": ["api", "v1", "services", "renewal-reminder"] },
+						"body": { "mode": "raw", "raw": "{}" }
+					},
+					"response": []
+				}
+			]
+		}
+	]
+}

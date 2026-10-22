@@ -1,3 +1,15 @@
+# Hardening: never expose dotfiles / config / internal scripts over HTTP.
+Options -Indexes
+<FilesMatch "^\.|\.(env|md|sql|log|htaccess|htpasswd)$">
+    Require all denied
+</FilesMatch>
+<FilesMatch "^(config|general|mint-cron-token)\.php$">
+    Require all denied
+</FilesMatch>
+# Block direct execution of any PHP file inside internal directories.
+RedirectMatch 403 ^/(connection|helpers|sso|notification)/.*\.php$
+
+# Front controller: send everything that isn't a real file/dir to index.php.
 RewriteEngine On
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d

@@ -1,0 +1,284 @@
+<?php
+
+require_once __DIR__ . '/../general.php';
+require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/product_types.php';
+require_once __DIR__ . '/../helpers/risk_details.php'; // RISK_FIELDS, used by productTypeCatalog()
+
+// --- PRODUCT TYPES (fixed list + per-type form options) ---
+function getProductTypes() {
+    jsonResponse(200, 'Product types found', ['data' => productTypeCatalog()]);
+}
+
+// --- GET ALL ---
+function getAllMasterProducts($conn, $company_id) {
+    $company_id = mysqli_real_escape_string($conn, $company_id);
+
+    $result = mysqli_query($conn,
+        "SELECT product_id, product_code, product_name, product_type, commission_rate,
+                default_tax_rate, policy_prefixes, is_active,
+                created_by, created_at, updated_by, updated_at
+         FROM " . APP_SCHEMA . ".master_products
+         WHERE company_id = '$company_id'
+         ORDER BY product_name ASC"
+    );
+
+    if ($result && mysqli_num_rows($result) > 0) {
+        jsonResponse(200, 'Master products found', ['data' => mysqli_fetch_all($result, MYSQLI_ASSOC)]);
+    } else {
+        jsonResponse(404, 'No master products found');
+    }
+}
+
+// --- CREATE ---
+function createMasterProduct($conn, $input, $username, $company_id) {
+    foreach (['product_code', 'product_name', 'commission_rate'] as $field) {
+        if (!isset($input[$field]) || (is_string($input[$field]) && trim($input[$field]) === '')) {
+            jsonResponse(400, "$field is required");
+            return;
+        }
+    }
+
+    $product_type = strtolower(trim((string)($input['product_type'] ?? '')));
+    if (!isValidProductType($product_type)) {
+        jsonResponse(400, 'product_type is required and must be one of: ' . implode(', ', array_keys(PRODUCT_TYPES)));
+        return;
+    }
+
+    $product_code    = strtolower(trim(mysqli_real_escape_string($conn, $input['product_code'])));
+    $product_name    = trim(mysqli_real_escape_string($conn, $input['product_name']));
+    $commission_rate = $input['commission_rate'];
+
+    if (!is_numeric($commission_rate) || $commission_rate < 0 || $commission_rate > 100) {
+        jsonResponse(400, 'commission_rate must be a number between 0 and 100');
+        return;
+    }
+    $commission_rate = number_format((float)$commission_rate, 2, '.', '');
+
+    // [NEW v1.1] default_tax_rate: decimal 0–1 (e.g. 0.0250 = 2.5% PPh). Defaults to 0.025.
+    $default_tax_rate = 0.025;
+    if (isset($input['default_tax_rate']) && $input['default_tax_rate'] !== '') {
+        $t = (float)$input['default_tax_rate'];
+        if ($t < 0 || $t > 1) {
+            jsonResponse(400, 'default_tax_rate must be a decimal between 0 and 1 (e.g. 0.025 = 2.5%)');
+            return;
+        }
+        $default_tax_rate = $t;
+    }
+    $default_tax_rate = number_format($default_tax_rate, 4, '.', '');
+
+    $policy_prefixes_sql = 'NULL';
+    if (isset($input['policy_prefixes']) && trim($input['policy_prefixes']) !== '') {
+        $policy_prefixes_sql = "'" . mysqli_real_escape_string($conn, trim($input['policy_prefixes'])) . "'";
+    }
+
+    $dup = mysqli_query($conn,
+        "SELECT 1 FROM " . APP_SCHEMA . ".master_products
+         WHERE company_id = '$company_id' AND product_code = '$product_code' LIMIT 1"
+    );
+    if (mysqli_num_rows($dup) > 0) {
+        jsonResponse(409, 'A master product with this code already exists');
+        return;
+    }
+
+    $product_id = 'prod_' . uniqid();
+    $now        = date('Y-m-d H:i:s');
+
+    $sql = "INSERT INTO " . APP_SCHEMA . ".master_products
+                (product_id, company_id, product_code, product_name, product_type,
+                 commission_rate, default_tax_rate, policy_prefixes, created_by, created_at)
+            VALUES
+                ('$product_id', '$company_id', '$product_code', '$product_name', '$product_type',
+                 $commission_rate, $default_tax_rate, $policy_prefixes_sql, '$username', '$now')";
+
+    if (mysqli_query($conn, $sql)) {
+        jsonResponse(201, 'Master product created', ['product_id' => $product_id]);
+    } else {
+        jsonResponse(500, 'Failed to create master product', ['error' => mysqli_error($conn)]);
+    }
+}
+
+// --- GET DETAIL ---
+function getMasterProductDetail($conn, $product_id, $company_id) {
+    $product_id = mysqli_real_escape_string($conn, $product_id);
+    $company_id = mysqli_real_escape_string($conn, $company_id);
+
+    $result = mysqli_query($conn,
+        "SELECT product_id, product_code, product_name, product_type, commission_rate,
+                default_tax_rate, policy_prefixes, is_active,
+                created_by, created_at, updated_by, updated_at
+         FROM " . APP_SCHEMA . ".master_products
+         WHERE product_id = '$product_id' AND company_id = '$company_id' LIMIT 1"
+    );
+
+    if (!$result || mysqli_num_rows($result) === 0) {
+        jsonResponse(404, 'Master product not found');
+        return;
+    }
+
+    jsonResponse(200, 'Master product found', mysqli_fetch_assoc($result));
+}
+
+// --- UPDATE ---
+function updateMasterProduct($conn, $product_id, $input, $username, $company_id) {
+    $product_id = mysqli_real_escape_string($conn, $product_id);
+    $company_id = mysqli_real_escape_string($conn, $company_id);
+
+    $check = mysqli_query($conn,
+        "SELECT product_code FROM " . APP_SCHEMA . ".master_products
+         WHERE product_id = '$product_id' AND company_id = '$company_id' LIMIT 1"
+    );
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Master product not found');
+        return;
+    }
+    $current = mysqli_fetch_assoc($check);
+    $updates = [];
+
+    if (isset($input['product_code'])) {
+        $code = strtolower(trim(mysqli_real_escape_string($conn, $input['product_code'])));
+        if ($code !== $current['product_code']) {
+            $dup = mysqli_query($conn,
+                "SELECT 1 FROM " . APP_SCHEMA . ".master_products
+                 WHERE company_id = '$company_id' AND product_code = '$code' AND product_id != '$product_id' LIMIT 1"
+            );
+            if (mysqli_num_rows($dup) > 0) {
+                jsonResponse(409, 'A master product with this code already exists');
+                return;
+            }
+        }
+        $updates[] = "product_code = '$code'";
+    }
+
+    if (isset($input['product_name'])) {
+        $name = trim(mysqli_real_escape_string($conn, $input['product_name']));
+        $updates[] = "product_name = '$name'";
+    }
+
+    if (isset($input['product_type'])) {
+        $type = strtolower(trim((string)$input['product_type']));
+        if (!isValidProductType($type)) {
+            jsonResponse(400, 'product_type must be one of: ' . implode(', ', array_keys(PRODUCT_TYPES)));
+            return;
+        }
+        $updates[] = "product_type = '$type'";
+    }
+
+    if (isset($input['commission_rate'])) {
+        $rate = $input['commission_rate'];
+        if (!is_numeric($rate) || $rate < 0 || $rate > 100) {
+            jsonResponse(400, 'commission_rate must be a number between 0 and 100');
+            return;
+        }
+        $updates[] = "commission_rate = " . number_format((float)$rate, 2, '.', '');
+    }
+
+    // [NEW v1.1] Update default PPh rate for this product type.
+    if (isset($input['default_tax_rate']) && $input['default_tax_rate'] !== '') {
+        $t = (float)$input['default_tax_rate'];
+        if ($t < 0 || $t > 1) {
+            jsonResponse(400, 'default_tax_rate must be a decimal between 0 and 1 (e.g. 0.025 = 2.5%)');
+            return;
+        }
+        $updates[] = "default_tax_rate = " . number_format($t, 4, '.', '');
+    }
+
+    if (array_key_exists('policy_prefixes', $input)) {
+        $val = trim($input['policy_prefixes'] ?? '');
+        $updates[] = $val !== ''
+            ? "policy_prefixes = '" . mysqli_real_escape_string($conn, $val) . "'"
+            : "policy_prefixes = NULL";
+    }
+
+    if (isset($input['is_active'])) {
+        $updates[] = "is_active = " . ($input['is_active'] ? 1 : 0);
+    }
+
+    if (empty($updates)) {
+        jsonResponse(400, 'No fields provided for update');
+        return;
+    }
+
+    $now = date('Y-m-d H:i:s');
+    $updates[] = "updated_by = '$username'";
+    $updates[] = "updated_at = '$now'";
+
+    if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".master_products SET " . implode(', ', $updates) . " WHERE product_id = '$product_id' AND company_id = '$company_id'")) {
+        jsonResponse(200, 'Master product updated successfully');
+    } else {
+        jsonResponse(500, 'Failed to update master product', ['error' => mysqli_error($conn)]);
+    }
+}
+
+// --- DELETE ---
+function deleteMasterProduct($conn, $product_id, $company_id) {
+    $product_id = mysqli_real_escape_string($conn, $product_id);
+    $company_id = mysqli_real_escape_string($conn, $company_id);
+
+    $check = mysqli_query($conn,
+        "SELECT 1 FROM " . APP_SCHEMA . ".master_products WHERE product_id = '$product_id' AND company_id = '$company_id' LIMIT 1"
+    );
+    if (mysqli_num_rows($check) === 0) {
+        jsonResponse(404, 'Master product not found');
+        return;
+    }
+
+    if (mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".master_products WHERE product_id = '$product_id' AND company_id = '$company_id'")) {
+        jsonResponse(200, 'Master product deleted successfully');
+    } else {
+        jsonResponse(500, 'Failed to delete master product', ['error' => mysqli_error($conn)]);
+    }
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+
+$authUser   = requireAuth();
+$method     = $_SERVER['REQUEST_METHOD'];
+$company_id = $authUser['company_id'] ?? null;
+$username   = $authUser['sub'] ?? $authUser['user_id'] ?? null;
+
+if (!$company_id) {
+    jsonResponse(400, 'company_id is required');
+    exit;
+}
+
+$product_id = !empty($action) ? $action : null;
+
+try {
+    $conn = getConn();
+
+    if ($product_id) {
+        switch ($method) {
+            case 'GET':
+                if ($product_id === 'types') { getProductTypes(); break; }
+                getMasterProductDetail($conn, $product_id, $company_id);
+                break;
+            case 'PUT':
+                $input = json_decode(file_get_contents('php://input'), true) ?? [];
+                updateMasterProduct($conn, $product_id, $input, $username, $company_id);
+                break;
+            case 'DELETE':
+                deleteMasterProduct($conn, $product_id, $company_id);
+                break;
+            default:
+                jsonResponse(405, 'Method Not Allowed');
+        }
+    } else {
+        switch ($method) {
+            case 'GET':
+                getAllMasterProducts($conn, $company_id);
+                break;
+            case 'POST':
+                $input = json_decode(file_get_contents('php://input'), true) ?? [];
+                createMasterProduct($conn, $input, $username, $company_id);
+                break;
+            default:
+                jsonResponse(405, 'Method Not Allowed');
+        }
+    }
+
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
+}
