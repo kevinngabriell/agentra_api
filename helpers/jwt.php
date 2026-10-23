@@ -2,14 +2,17 @@
 require_once __DIR__ . '/../config.php';
 
 class JWT {
-    public const ACCESS_TTL  = 36000;  // 10 hours
-    public const REFRESH_TTL = 604800; // 7 days
+    public const ACCESS_TTL  = 900;     // 15 minutes (was 36000 / 10h — too long for an unrevokable stateless token)
+    public const REFRESH_TTL = 604800;  // 7 days
+    private const LEEWAY = 5;           // seconds of clock-skew tolerance for exp/nbf
 
     public static function encode(array $payload, int $expireSeconds = self::ACCESS_TTL): string {
         $header = self::base64url(json_encode(['alg' => 'HS256', 'typ' => 'JWT']));
 
         $payload['iat'] = time();
         $payload['exp'] = time() + $expireSeconds;
+        $payload['iss'] = 'agentra';
+        $payload['aud'] = 'agentra';
 
         $body = self::base64url(json_encode($payload));
         $sig  = self::base64url(hash_hmac('sha256', "$header.$body", JWT_SECRET, true));
@@ -22,12 +25,20 @@ class JWT {
     }
 
     public static function decode(string $token, bool $allowRefresh = false): array {
+        $token = trim($token);
         $parts = explode('.', $token);
         if (count($parts) !== 3) {
             throw new Exception('Invalid token format', 401);
         }
 
         [$header, $body, $sig] = $parts;
+
+        // Defense in depth: pin the algorithm explicitly so a future refactor
+        // that branches on `alg` cannot open the classic alg-confusion / `none` attack.
+        $hdr = json_decode(self::base64urlDecode($header), true);
+        if (!is_array($hdr) || ($hdr['alg'] ?? '') !== 'HS256' || ($hdr['typ'] ?? '') !== 'JWT') {
+            throw new Exception('Invalid token header', 401);
+        }
 
         $expected = self::base64url(hash_hmac('sha256', "$header.$body", JWT_SECRET, true));
         if (!hash_equals($expected, $sig)) {
@@ -39,8 +50,16 @@ class JWT {
             throw new Exception('Malformed token payload', 401);
         }
 
-        if (time() > $payload['exp']) {
+        // Issuer / audience — shared-secret apps must not validate each other's tokens.
+        if (($payload['iss'] ?? null) !== 'agentra' || ($payload['aud'] ?? null) !== 'agentra') {
+            throw new Exception('Invalid token issuer or audience', 401);
+        }
+
+        if (time() - self::LEEWAY > $payload['exp']) {
             throw new Exception('Token expired', 401);
+        }
+        if (isset($payload['nbf']) && time() + self::LEEWAY < $payload['nbf']) {
+            throw new Exception('Token not yet valid', 401);
         }
 
         $isRefresh = ($payload['type'] ?? '') === 'refresh';

@@ -11,13 +11,16 @@ function refreshToken($conn, $input) {
 
     try {
         $payload = JWT::decode($refreshToken, allowRefresh: true);
-    } catch (Exception $e) {
-        jsonResponse(401, 'Invalid or expired refresh token');
+    } catch (\Throwable $e) {
+        Response::unauthorized('Invalid or expired refresh token');
     }
 
-    $userId = cleanInput($payload['sub'] ?? '');
+    $userId = mysqli_real_escape_string($conn, $payload['sub'] ?? '');
 
-    $result = mysqli_query($conn, "SELECT user_id, username, app_role_id
+    // Include company_id in the lookup so the refreshed access token keeps
+    // the same claims as the original login token. Previously this dropped
+    // company_id, which broke every company-scoped query after one refresh.
+    $result = mysqli_query($conn, "SELECT user_id, username, app_role_id, company_id, account_status
         FROM " . CORE_SCHEMA . ".app_user
         WHERE user_id = '$userId'
         LIMIT 1");
@@ -28,10 +31,15 @@ function refreshToken($conn, $input) {
 
     $user = mysqli_fetch_assoc($result);
 
+    if (in_array($user['account_status'] ?? '', ['suspended', 'disabled', 'rejected'], true)) {
+        throw ApiException::from('ERR_AUTH_003');
+    }
+
     $claims = [
-        'sub'      => $user['user_id'],
-        'username' => $user['username'],
-        'role'     => $user['app_role_id'],
+        'sub'        => $user['user_id'],
+        'username'   => $user['username'],
+        'role'       => $user['app_role_id'],
+        'company_id' => $user['company_id'],
     ];
 
     jsonResponse(200, 'Token refreshed successfully', [
@@ -48,13 +56,15 @@ try {
 
     switch ($method) {
         case 'POST':
-            $input = json_decode(file_get_contents('php://input'), true);
+            $input = input();
             refreshToken($conn, $input);
             break;
         default:
             jsonResponse(405, 'Method not allowed');
             break;
     }
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log('refresh exception: ' . $e->getMessage());
+    Response::internalError();
 }

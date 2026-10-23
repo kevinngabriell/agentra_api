@@ -155,12 +155,29 @@ function updateCoassurance($conn, $policy_id, $coassurance_id, $company_id, $inp
         $updates[] = "co_insurer_name = '$val'";
     }
     if (array_key_exists('co_insurer_id', $input)) {
-        $updates[] = $input['co_insurer_id']
-            ? "co_insurer_id = '" . mysqli_real_escape_string($conn, $input['co_insurer_id']) . "'"
-            : "co_insurer_id = NULL";
+        // IDOR guard: when a co_insurer_id is supplied, verify it belongs to
+        // the requesting company — same check as addCoassurance. Previously
+        // updateCoassurance interpolated the input directly, letting an
+        // attacker link the co-assurance record to another company's insurer.
+        if ($input['co_insurer_id']) {
+            $eid = mysqli_real_escape_string($conn, $input['co_insurer_id']);
+            $ccid = mysqli_real_escape_string($conn, $company_id);
+            $chk = mysqli_query($conn,
+                "SELECT 1 FROM " . APP_SCHEMA . ".insurers
+                 WHERE insurer_id = '$eid' AND company_id = '$ccid' LIMIT 1"
+            );
+            if (!$chk || mysqli_num_rows($chk) === 0) {
+                jsonResponse(404, 'co_insurer_id not found or does not belong to your company');
+                return;
+            }
+            $updates[] = "co_insurer_id = '" . mysqli_real_escape_string($conn, $input['co_insurer_id']) . "'";
+        } else {
+            $updates[] = "co_insurer_id = NULL";
+        }
     }
     if (isset($input['is_leader'])) {
-        $updates[] = "is_leader = " . ($input['is_leader'] ? 1 : 0);
+        // Use filter_var so string "false" is treated as false (PHP truthiness would treat it as true).
+        $updates[] = "is_leader = " . (filter_var($input['is_leader'], FILTER_VALIDATE_BOOLEAN) ? 1 : 0);
     }
     if (isset($input['share_percent'])) {
         $share = (float)$input['share_percent'];

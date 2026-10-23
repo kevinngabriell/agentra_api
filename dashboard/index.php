@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/claims.php';
 
 // --- DB-001: GET /api/v1/dashboard/stats ---
 function getDashboardStats($conn, $company_id) {
@@ -79,8 +80,14 @@ function getDashboardStats($conn, $company_id) {
         'lapsed_pct'     => $bd_total > 0 ? round(((int)($bd['lapsed']      ?? 0) / $bd_total) * 100, 1) : 0,
     ];
 
+    $r = mysqli_query($conn, "SELECT COUNT(*) AS cnt FROM " . APP_SCHEMA . ".claims
+        WHERE company_id = '$cid' AND is_deleted = 0 AND status IN ('" . implode("','", CLAIM_OPEN_STATUSES) . "')");
+    $open_claims = $r ? (int)mysqli_fetch_assoc($r)['cnt'] : 0;
+
     jsonResponse(200, 'OK', [
         'total_active_policies'      => $total_active,
+        'open_claims'                => $open_claims,
+        'claims_pending_documents'   => claimsPendingDocumentsCount($conn, $cid),
         'renewals_this_month'        => $renewals_this_month,
         'expiring_this_week'         => $expiring_this_week,
         'pending_commissions_amount' => $pending_commissions,
@@ -171,17 +178,19 @@ try {
             getDashboardStats($conn, $company_id);
             break;
         case 'activity':
-            $limit = min(50, max(1, (int)($_GET['limit'] ?? 10)));
+            $limit = min(15, max(1, (int)($_GET['limit'] ?? 15)));
             getDashboardActivity($conn, $company_id, $limit);
             break;
         case 'today-actions':
-            $limit = min(50, max(1, (int)($_GET['limit'] ?? 10)));
+            $limit = min(15, max(1, (int)($_GET['limit'] ?? 15)));
             getDashboardTodayActions($conn, $company_id, $limit);
             break;
         default:
             jsonResponse(404, 'Route not found');
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

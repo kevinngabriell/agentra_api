@@ -2,7 +2,13 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/sub_agents.php';
 require_once __DIR__ . '/export.php';
+require_once __DIR__ . '/../helpers/subscription.php';
+define('CUSTOMER_GROUPS_AS_LIBRARY', true);
+require_once __DIR__ . '/../customer-groups/index.php';
+require_once __DIR__ . '/overview.php';
+require_once __DIR__ . '/../helpers/import.php';
 
 // --- CREATE ---
 function createCustomer($conn, $input, $username, $company_id){
@@ -37,7 +43,11 @@ function createCustomer($conn, $input, $username, $company_id){
     }
 
     $notes = isset($input['notes']) ? trim(mysqli_real_escape_string($conn, $input['notes'])) : null;
-    $referred_by_agent_id = isset($input['referred_by_agent_id']) ? mysqli_real_escape_string($conn, $input['referred_by_agent_id']) : null;
+    // [NEW v1.7.0] Referring sub-agent must be an active sub-agent of this company; naming one makes the customer a referral.
+    $referred_by_agent_id = requireActiveSubAgentId($conn, $company_id, $input['referred_by_agent_id'] ?? null);
+    if ($referred_by_agent_id !== null) {
+        $source = 'referral';
+    }
 
     if ($customer_type === 'individual') {
         $nik = isset($input['nik']) ? trim(mysqli_real_escape_string($conn, $input['nik'])) : null;
@@ -113,7 +123,7 @@ function getAllCustomers($conn, $company_id, $params = '', $customer_type = '', 
     $customer_type = mysqli_real_escape_string($conn, $customer_type);
     $status        = mysqli_real_escape_string($conn, $status);
     $page          = max(1, (int)$page);
-    $limit         = min(100, max(1, (int)$limit));
+    $limit         = min(15, max(1, (int)$limit));
     $offset        = ($page - 1) * $limit;
 
     $where = "company_id = '$company_id'";
@@ -170,6 +180,13 @@ function getDetailCustomer($conn, $customer_id, $company_id){
 
     $data = mysqli_fetch_assoc($result);
 
+    // [NEW v1.11.0] Customer group
+    $data['group_name'] = null;
+    if (!empty($data['group_id'])) {
+        $gr = mysqli_query($conn, "SELECT name FROM " . APP_SCHEMA . ".customer_groups WHERE group_id = '" . mysqli_real_escape_string($conn, $data['group_id']) . "' LIMIT 1");
+        if ($gr && mysqli_num_rows($gr) > 0) $data['group_name'] = mysqli_fetch_assoc($gr)['name'];
+    }
+
     // Linked policies summary
     $policies_total = 0;
     $recent_policies = [];
@@ -206,7 +223,7 @@ function getCustomerPolicies($conn, $customer_id, $company_id, $params){
     }
 
     $page   = max(1, (int)($params['page']  ?? 1));
-    $limit  = min(100, max(1, (int)($params['limit'] ?? 10)));
+    $limit  = min(15, max(1, (int)($params['limit'] ?? 15)));
     $offset = ($page - 1) * $limit;
 
     $renewal_status = isset($params['renewal_status']) ? mysqli_real_escape_string($conn, $params['renewal_status']) : '';
@@ -286,9 +303,16 @@ function updateCustomer($conn, $customer_id, $input, $company_id){
         }
     }
 
-    if (isset($input['referred_by_agent_id'])) {
-        $referred_by = mysqli_real_escape_string($conn, $input['referred_by_agent_id']);
-        $updates[] = "referred_by_agent_id = " . ($referred_by !== '' ? "'$referred_by'" : "NULL");
+    // [NEW v1.7.0] Validated against sub_agents; a direct customer has no referrer, a referrer makes it a referral.
+    if (array_key_exists('referred_by_agent_id', $input)) {
+        $referred_by = requireActiveSubAgentId($conn, $company_id, $input['referred_by_agent_id']);
+        $updates[] = "referred_by_agent_id = " . ($referred_by !== null ? "'" . mysqli_real_escape_string($conn, $referred_by) . "'" : 'NULL');
+        if ($referred_by !== null) {
+            $updates[] = "source = 'referral'";
+        }
+    }
+    if (($input['source'] ?? null) === 'direct' && !array_key_exists('referred_by_agent_id', $input)) {
+        $updates[] = "referred_by_agent_id = NULL";
     }
 
     if ($customer_type === 'individual') {
@@ -450,10 +474,30 @@ function deleteCustomer($conn, $customer_id, $company_id){
         return;
     }
 
+    // Refuse to delete a customer that still has linked policies — otherwise
+    // those policies are orphaned (customer_id points to a nonexistent row),
+    // breaking joins and reports. Soft-delete is the safer long-term option.
+    $polCheck = mysqli_query($conn, "SELECT COUNT(*) AS cnt FROM " . APP_SCHEMA . ".policies WHERE customer_id = '$customer_id' AND company_id = '$company_id'");
+    if ($polCheck) {
+        $cnt = (int)mysqli_fetch_assoc($polCheck)['cnt'];
+        if ($cnt > 0) {
+            jsonResponse(409, 'Cannot delete customer with existing policies. Deactivate the customer instead.');
+            return;
+        }
+    }
+
+    // Same for documents (KYC files are an audit trail and FK-bound to the customer).
+    $docCheck = mysqli_query($conn, "SELECT COUNT(*) AS cnt FROM " . APP_SCHEMA . ".documents WHERE customer_id = '$customer_id'");
+    if ($docCheck && (int)mysqli_fetch_assoc($docCheck)['cnt'] > 0) {
+        jsonResponse(409, 'Cannot delete customer with documents. Deactivate the customer instead.');
+        return;
+    }
+
     if (mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".customers WHERE customer_id = '$customer_id' AND company_id = '$company_id'")) {
         jsonResponse(200, 'Customer deleted successfully');
     } else {
-        jsonResponse(500, 'Failed to delete customer', ['error' => mysqli_error($conn)]);
+        error_log('deleteCustomer DB error: ' . mysqli_error($conn));
+        jsonResponse(500, 'Failed to delete customer');
     }
 }
 
@@ -473,7 +517,7 @@ function getFollowUps($conn, $customer_id, $company_id){
     }
 
     $page   = max(1, (int)($_GET['page'] ?? 1));
-    $limit  = min(100, max(1, (int)($_GET['limit'] ?? 10)));
+    $limit  = min(15, max(1, (int)($_GET['limit'] ?? 15)));
     $offset = ($page - 1) * $limit;
 
     $result      = mysqli_query($conn, "SELECT fl.* FROM " . APP_SCHEMA . ".follow_up_logs fl
@@ -503,139 +547,170 @@ function getFollowUps($conn, $customer_id, $company_id){
     ]);
 }
 
-// --- IMPORT (CSV) ---
-function importCustomers($conn, $company_id, $username){
-    if (empty($_FILES['file'])) {
-        jsonResponse(400, 'CSV file is required (field name: file)');
-        return;
+// --- IMPORT (CSV / XLSX) ---
+const CUSTOMER_IMPORT_TEMPLATE = [
+    'customer_type' => 'individual', 'display_name' => 'Budi Santoso', 'status' => 'active', 'source' => 'direct', 'notes' => '',
+    'nik' => '3174012345678901', 'date_of_birth' => '1990-05-17', 'npwp_personal' => '', 'personal_phone' => '081234567890',
+    'personal_whatsapp' => '081234567890', 'personal_email' => 'budi@example.com', 'personal_address' => 'Jl. Merdeka No. 1, Jakarta',
+    'company_legal_name' => '', 'npwp_company' => '', 'nib' => '', 'business_type' => '', 'company_phone' => '', 'company_email' => '',
+    'operational_address' => '', 'legal_address' => '', 'pic_name' => '', 'pic_role' => '', 'pic_phone' => '', 'pic_whatsapp' => '', 'pic_email' => '',
+];
+
+/** Nullable quoted SQL literal for an optional import cell. */
+function importSqlOrNull($conn, array $d, string $key): string {
+    $v = trim((string)($d[$key] ?? ''));
+    return $v === '' ? 'NULL' : "'" . mysqli_real_escape_string($conn, $v) . "'";
+}
+
+/**
+ * Validates one import row. Returns ['errors' => string[], 'sql' => ?string]; sql is set only when errors is empty.
+ * $seen tracks NIK / NPWP values already taken in this file, on top of the ones already in the database.
+ */
+function validateCustomerImportRow($conn, string $company_id, string $username, string $now, array $d, array &$seen): array {
+    $errors = [];
+    $customer_type = strtolower(trim((string)($d['customer_type'] ?? '')));
+    $display_name  = trim((string)($d['display_name'] ?? ''));
+
+    if (!in_array($customer_type, ['individual', 'company'], true)) $errors[] = 'customer_type must be individual or company';
+    if ($display_name === '') $errors[] = 'display_name is empty';
+
+    $status = strtolower(trim((string)($d['status'] ?? '')));
+    if ($status !== '' && !in_array($status, ['active', 'inactive', 'lapsed'], true)) $errors[] = 'status must be active, inactive or lapsed';
+    $source = strtolower(trim((string)($d['source'] ?? '')));
+    if ($source !== '' && !in_array($source, ['direct', 'referral'], true)) $errors[] = 'source must be direct or referral';
+    $status = $status === '' ? 'active' : $status;
+    $source = $source === '' ? 'direct' : $source;
+
+    foreach (['personal_email', 'company_email', 'pic_email'] as $emailKey) {
+        $e = trim((string)($d[$emailKey] ?? ''));
+        if ($e !== '' && !filter_var($e, FILTER_VALIDATE_EMAIL)) $errors[] = "$emailKey is not a valid email";
+    }
+    $dob = trim((string)($d['date_of_birth'] ?? ''));
+    $dobNorm = $dob === '' ? null : importNormalizeDate($dob);
+    if ($dob !== '' && $dobNorm === null) $errors[] = 'date_of_birth must be YYYY-MM-DD';
+
+    $idKey = null; $idCol = null;
+    if ($customer_type === 'individual') {
+        $nik = trim((string)($d['nik'] ?? ''));
+        if (strlen($nik) !== 16 || !ctype_digit($nik)) $errors[] = 'Invalid or missing NIK (must be 16 digits)';
+        else { $idKey = "nik:$nik"; $idCol = ['nik', $nik, 'NIK']; }
+    } elseif ($customer_type === 'company') {
+        foreach (['company_legal_name', 'npwp_company', 'pic_name', 'pic_phone', 'pic_whatsapp'] as $f) {
+            if (trim((string)($d[$f] ?? '')) === '') $errors[] = "$f is required for company";
+        }
+        $npwp = trim((string)($d['npwp_company'] ?? ''));
+        if ($npwp !== '') { $idKey = "npwp:$npwp"; $idCol = ['npwp_company', $npwp, 'NPWP']; }
     }
 
-    $file = $_FILES['file'];
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        jsonResponse(400, 'File upload error code: ' . $file['error']);
-        return;
-    }
-
-    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    if ($ext !== 'csv') {
-        jsonResponse(400, 'Only CSV files are supported');
-        return;
-    }
-
-    $handle = fopen($file['tmp_name'], 'r');
-    if (!$handle) {
-        jsonResponse(500, 'Failed to read uploaded file');
-        return;
-    }
-
-    $headers = fgetcsv($handle);
-    if (!$headers) {
-        fclose($handle);
-        jsonResponse(400, 'Empty or invalid CSV file');
-        return;
-    }
-
-    $headers = array_map('trim', $headers);
-    foreach (['customer_type', 'display_name'] as $required) {
-        if (!in_array($required, $headers, true)) {
-            fclose($handle);
-            jsonResponse(400, "Missing required CSV column: $required");
-            return;
+    if ($idKey !== null) {
+        if (isset($seen[$idKey])) {
+            $errors[] = "Duplicate {$idCol[2]} in file (also on row {$seen[$idKey]})";
+        } else {
+            $col = $idCol[0];
+            $val = mysqli_real_escape_string($conn, $idCol[1]);
+            $res = mysqli_query($conn, "SELECT display_name FROM " . APP_SCHEMA . ".customers WHERE company_id = '$company_id' AND $col = '$val' LIMIT 1");
+            if ($res && ($ex = mysqli_fetch_assoc($res))) $errors[] = "{$idCol[2]} already registered to \"{$ex['display_name']}\"";
         }
     }
+    if ($errors) return ['errors' => $errors, 'sql' => null];
+
+    $customer_id = 'cust_' . bin2hex(random_bytes(10));
+    $ct_s     = mysqli_real_escape_string($conn, $customer_type);
+    $dn_s     = mysqli_real_escape_string($conn, $display_name);
+    $status_s = mysqli_real_escape_string($conn, $status);
+    $source_s = mysqli_real_escape_string($conn, $source);
+    $notes_s  = importSqlOrNull($conn, $d, 'notes');
+    $o = fn(string $k) => importSqlOrNull($conn, $d, $k);
+    $u = mysqli_real_escape_string($conn, (string)$username);
+
+    if ($customer_type === 'individual') {
+        $nik_s = mysqli_real_escape_string($conn, trim((string)$d['nik']));
+        $dob_s = $dobNorm === null ? 'NULL' : "'$dobNorm'";
+        $sql = "INSERT INTO " . APP_SCHEMA . ".customers (customer_id, company_id, customer_type, status, source, display_name, notes, nik, date_of_birth, personal_phone, personal_whatsapp, personal_email, personal_address, npwp_personal, created_by, created_at)
+            VALUES ('$customer_id', '$company_id', '$ct_s', '$status_s', '$source_s', '$dn_s', $notes_s, '$nik_s', $dob_s, {$o('personal_phone')}, {$o('personal_whatsapp')}, {$o('personal_email')}, {$o('personal_address')}, {$o('npwp_personal')}, '$u', '$now')";
+    } else {
+        $q = fn(string $k) => mysqli_real_escape_string($conn, trim((string)$d[$k]));
+        $sql = "INSERT INTO " . APP_SCHEMA . ".customers (customer_id, company_id, customer_type, status, source, display_name, notes, company_legal_name, business_type, npwp_company, nib, operational_address, legal_address, company_phone, company_email, pic_name, pic_role, pic_phone, pic_whatsapp, pic_email, created_by, created_at)
+            VALUES ('$customer_id', '$company_id', '$ct_s', '$status_s', '$source_s', '$dn_s', $notes_s, '{$q('company_legal_name')}', {$o('business_type')}, '{$q('npwp_company')}', {$o('nib')}, {$o('operational_address')}, {$o('legal_address')}, {$o('company_phone')}, {$o('company_email')}, '{$q('pic_name')}', {$o('pic_role')}, '{$q('pic_phone')}', '{$q('pic_whatsapp')}', {$o('pic_email')}, '$u', '$now')";
+    }
+    return ['errors' => [], 'sql' => $sql, 'idKey' => $idKey];
+}
+
+// POST /customers/import              multipart: file (CSV or XLSX), dry_run=1 to validate without saving
+// GET  /customers/import/template     ?format=csv|xlsx
+function importCustomers($conn, $company_id, $username){
+    $table = importReadUpload();
+    foreach (['customer_type', 'display_name'] as $required) {
+        if (!in_array($required, $table['headers'], true)) {
+            jsonResponse(400, "Missing required column: $required");
+        }
+    }
+    $dryRun = in_array(strtolower((string)($_POST['dry_run'] ?? '')), ['1', 'true'], true);
 
     $now      = date('Y-m-d H:i:s');
-    $inserted = 0;
-    $failed   = [];
-    $row_num  = 1;
+    $seen     = [];
+    $valid    = [];   // [row_num => sql]
+    $failed   = [];   // [row, reason]
+    $preview  = [];
 
-    while (($row = fgetcsv($handle)) !== false) {
-        $row_num++;
-        if (count($row) !== count($headers)) {
-            $failed[] = ['row' => $row_num, 'reason' => 'Column count mismatch'];
-            continue;
-        }
-
-        $d = array_combine($headers, $row);
-
-        $customer_type = trim($d['customer_type'] ?? '');
-        $display_name  = trim($d['display_name'] ?? '');
-
-        if (!in_array($customer_type, ['individual', 'company'], true)) {
-            $failed[] = ['row' => $row_num, 'reason' => 'Invalid customer_type'];
-            continue;
-        }
-        if ($display_name === '') {
-            $failed[] = ['row' => $row_num, 'reason' => 'display_name is empty'];
-            continue;
-        }
-
-        $customer_id  = 'cust_' . uniqid();
-        $ct_s         = mysqli_real_escape_string($conn, $customer_type);
-        $dn_s         = mysqli_real_escape_string($conn, $display_name);
-        $status_s     = in_array(trim($d['status'] ?? ''), ['active', 'inactive', 'lapsed'], true) ? mysqli_real_escape_string($conn, trim($d['status'])) : 'active';
-        $source_s     = in_array(trim($d['source'] ?? ''), ['direct', 'referral'], true) ? mysqli_real_escape_string($conn, trim($d['source'])) : 'direct';
-        $notes_s      = (isset($d['notes']) && trim($d['notes']) !== '') ? "'" . mysqli_real_escape_string($conn, trim($d['notes'])) . "'" : 'NULL';
-
-        if ($customer_type === 'individual') {
-            $nik = trim($d['nik'] ?? '');
-            if (!$nik || strlen($nik) !== 16 || !ctype_digit($nik)) {
-                $failed[] = ['row' => $row_num, 'reason' => 'Invalid or missing NIK (must be 16 digits)'];
-                continue;
-            }
-            $nik_s  = mysqli_real_escape_string($conn, $nik);
-            $dob    = (isset($d['date_of_birth']) && trim($d['date_of_birth']) !== '')     ? "'" . mysqli_real_escape_string($conn, trim($d['date_of_birth'])) . "'"     : 'NULL';
-            $phone  = (isset($d['personal_phone']) && trim($d['personal_phone']) !== '')   ? "'" . mysqli_real_escape_string($conn, trim($d['personal_phone'])) . "'"   : 'NULL';
-            $wa     = (isset($d['personal_whatsapp']) && trim($d['personal_whatsapp']) !== '') ? "'" . mysqli_real_escape_string($conn, trim($d['personal_whatsapp'])) . "'" : 'NULL';
-            $email  = (isset($d['personal_email']) && trim($d['personal_email']) !== '')   ? "'" . mysqli_real_escape_string($conn, trim($d['personal_email'])) . "'"   : 'NULL';
-            $addr   = (isset($d['personal_address']) && trim($d['personal_address']) !== '') ? "'" . mysqli_real_escape_string($conn, trim($d['personal_address'])) . "'" : 'NULL';
-            $npwp   = (isset($d['npwp_personal']) && trim($d['npwp_personal']) !== '')     ? "'" . mysqli_real_escape_string($conn, trim($d['npwp_personal'])) . "'"     : 'NULL';
-
-            $sql = "INSERT INTO " . APP_SCHEMA . ".customers (customer_id, company_id, customer_type, status, source, display_name, notes, nik, date_of_birth, personal_phone, personal_whatsapp, personal_email, personal_address, npwp_personal, created_by, created_at)
-                VALUES ('$customer_id', '$company_id', '$ct_s', '$status_s', '$source_s', '$dn_s', $notes_s, '$nik_s', $dob, $phone, $wa, $email, $addr, $npwp, '$username', '$now')";
+    foreach ($table['rows'] as $r) {
+        $res = validateCustomerImportRow($conn, $company_id, (string)$username, $now, $r['data'], $seen);
+        if ($res['errors']) {
+            $failed[] = ['row' => $r['row'], 'reason' => implode('; ', $res['errors'])];
         } else {
-            $company_legal_name = trim($d['company_legal_name'] ?? '');
-            $npwp_company       = trim($d['npwp_company'] ?? '');
-            $pic_name           = trim($d['pic_name'] ?? '');
-            $pic_phone          = trim($d['pic_phone'] ?? '');
-            $pic_whatsapp       = trim($d['pic_whatsapp'] ?? '');
-
-            if (!$company_legal_name || !$npwp_company || !$pic_name || !$pic_phone || !$pic_whatsapp) {
-                $failed[] = ['row' => $row_num, 'reason' => 'Missing required fields for company type (company_legal_name, npwp_company, pic_name, pic_phone, pic_whatsapp)'];
-                continue;
-            }
-
-            $legal_s    = mysqli_real_escape_string($conn, $company_legal_name);
-            $npwp_co_s  = mysqli_real_escape_string($conn, $npwp_company);
-            $pic_name_s = mysqli_real_escape_string($conn, $pic_name);
-            $pic_ph_s   = mysqli_real_escape_string($conn, $pic_phone);
-            $pic_wa_s   = mysqli_real_escape_string($conn, $pic_whatsapp);
-            $btype      = (isset($d['business_type']) && trim($d['business_type']) !== '')         ? "'" . mysqli_real_escape_string($conn, trim($d['business_type'])) . "'"         : 'NULL';
-            $nib        = (isset($d['nib']) && trim($d['nib']) !== '')                             ? "'" . mysqli_real_escape_string($conn, trim($d['nib'])) . "'"                     : 'NULL';
-            $op_addr    = (isset($d['operational_address']) && trim($d['operational_address']) !== '') ? "'" . mysqli_real_escape_string($conn, trim($d['operational_address'])) . "'" : 'NULL';
-            $legal_addr = (isset($d['legal_address']) && trim($d['legal_address']) !== '')         ? "'" . mysqli_real_escape_string($conn, trim($d['legal_address'])) . "'"         : 'NULL';
-            $co_phone   = (isset($d['company_phone']) && trim($d['company_phone']) !== '')         ? "'" . mysqli_real_escape_string($conn, trim($d['company_phone'])) . "'"         : 'NULL';
-            $co_email   = (isset($d['company_email']) && trim($d['company_email']) !== '')         ? "'" . mysqli_real_escape_string($conn, trim($d['company_email'])) . "'"         : 'NULL';
-            $pic_role   = (isset($d['pic_role']) && trim($d['pic_role']) !== '')                   ? "'" . mysqli_real_escape_string($conn, trim($d['pic_role'])) . "'"               : 'NULL';
-            $pic_email  = (isset($d['pic_email']) && trim($d['pic_email']) !== '')                 ? "'" . mysqli_real_escape_string($conn, trim($d['pic_email'])) . "'"             : 'NULL';
-
-            $sql = "INSERT INTO " . APP_SCHEMA . ".customers (customer_id, company_id, customer_type, status, source, display_name, notes, company_legal_name, business_type, npwp_company, nib, operational_address, legal_address, company_phone, company_email, pic_name, pic_role, pic_phone, pic_whatsapp, pic_email, created_by, created_at)
-                VALUES ('$customer_id', '$company_id', '$ct_s', '$status_s', '$source_s', '$dn_s', $notes_s, '$legal_s', $btype, '$npwp_co_s', $nib, $op_addr, $legal_addr, $co_phone, $co_email, '$pic_name_s', $pic_role, '$pic_ph_s', '$pic_wa_s', $pic_email, '$username', '$now')";
+            $valid[$r['row']] = $res['sql'];
+            if (isset($res['idKey'])) $seen[$res['idKey']] = $r['row'];
         }
-
-        if (mysqli_query($conn, $sql)) {
-            $inserted++;
-        } else {
-            $failed[] = ['row' => $row_num, 'reason' => mysqli_error($conn)];
+        if (count($preview) < IMPORT_PREVIEW_ROWS) {
+            $preview[] = [
+                'row'           => $r['row'],
+                'customer_type' => strtolower(trim((string)($r['data']['customer_type'] ?? ''))),
+                'display_name'  => trim((string)($r['data']['display_name'] ?? '')),
+                'identifier'    => trim((string)(($r['data']['nik'] ?? '') ?: ($r['data']['npwp_company'] ?? ''))),
+                'errors'        => $res['errors'],
+            ];
         }
     }
 
-    fclose($handle);
+    if ($dryRun) {
+        jsonResponse(200, 'Import preview', [
+            'dry_run'      => true,
+            'total'        => count($table['rows']),
+            'valid_count'  => count($valid),
+            'failed_count' => count($failed),
+            'failed'       => $failed,
+            'preview'      => $preview,
+        ]);
+    }
+
+    // One transaction: a failure mid-import can't leave the first N rows saved while the response reports an error,
+    // so the client can safely retry without creating duplicates.
+    $inserted = 0;
+    mysqli_begin_transaction($conn);
+    try {
+        foreach ($valid as $row_num => $sql) {
+            if (mysqli_query($conn, $sql)) {
+                $inserted++;
+            } else {
+                // Real error stays in the server log; the client only sees a generic reason.
+                error_log("importCustomers row $row_num failed: " . mysqli_error($conn));
+                $failed[] = ['row' => $row_num, 'reason' => 'Database error'];
+            }
+        }
+        mysqli_commit($conn);
+    } catch (\Throwable $e) {
+        mysqli_rollback($conn);
+        RequestLogger::setException($e);
+        error_log('importCustomers exception: ' . $e->getMessage());
+        Response::error('ERR_COMMON_005', 'Import gagal — tidak ada baris yang berhasil disimpan', 500);
+    }
 
     jsonResponse(200, "Import completed. $inserted customer(s) imported.", [
-        'inserted'    => $inserted,
+        'dry_run'      => false,
+        'total'        => count($table['rows']),
+        'inserted'     => $inserted,
         'failed_count' => count($failed),
-        'failed'      => $failed,
+        'failed'       => $failed,
     ]);
 }
 
@@ -661,13 +736,31 @@ try {
     $conn = getConn();
 
     // POST /api/v1/customers/import
-    if ($method === 'POST' && $action === 'import') {
+    if ($action === 'import' && $sub_action === 'template') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        importSendTemplate('TEMPLATE IMPORT CUSTOMER', CUSTOMER_IMPORT_TEMPLATE, ($_GET['format'] ?? 'xlsx') === 'csv' ? 'csv' : 'xlsx');
+
+    } elseif ($method === 'POST' && $action === 'import') {
         importCustomers($conn, $company_id, $username);
 
     // GET /api/v1/customers/export
     } elseif ($action === 'export') {
         if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        requirePlanFeature($conn, $company_id, 'export');
         exportCustomers($conn, $company_id, $_GET);
+
+    // GET /api/v1/customers/{customer_id}/overview, /cross-sell   PUT /api/v1/customers/{customer_id}/group
+    } elseif ($customer_id && $sub_action === 'overview') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        getCustomerOverview($conn, $company_id, $customer_id, $_GET);
+
+    } elseif ($customer_id && $sub_action === 'cross-sell') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        getCustomerCrossSell($conn, $company_id, $customer_id, $_GET);
+
+    } elseif ($customer_id && $sub_action === 'group') {
+        if ($method !== 'PUT') { jsonResponse(405, 'Method Not Allowed'); }
+        setCustomerGroup($conn, $company_id, $customer_id, input(), $username);
 
     // PUT /api/v1/customers/{customer_id}/status
     } elseif ($customer_id && $sub_action === 'status') {
@@ -709,8 +802,8 @@ try {
                 $params        = $_GET['params'] ?? '';
                 $customer_type = $_GET['customer_type'] ?? '';
                 $status        = $_GET['status'] ?? '';
-                $page          = $_GET['page'] ?? 1;
-                $limit         = $_GET['limit'] ?? 10;
+                $page          = max(1, (int)($_GET['page'] ?? 1));
+                $limit         = min(15, max(1, (int)($_GET['limit'] ?? 15)));
                 getAllCustomers($conn, $company_id, $params, $customer_type, $status, $page, $limit);
                 break;
             case 'POST':
@@ -722,6 +815,10 @@ try {
         }
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (ApiException $e) {
+    throw $e;
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

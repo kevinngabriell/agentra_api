@@ -44,10 +44,14 @@ function createInsurer($conn, $input, $username, $company_id){
     }
 
     if ($is_primary) {
+        // Wrap the primary-flag reset + new INSERT in a transaction — if the
+        // INSERT fails after the reset, the company is left with NO primary
+        // insurer, which breaks downstream business logic that assumes one.
+        mysqli_begin_transaction($conn);
         mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".insurers SET is_primary = 0 WHERE company_id = '$company_id'");
     }
 
-    $insurer_id     = 'ins_' . uniqid();
+    $insurer_id     = 'ins_' . bin2hex(random_bytes(10));
     $now            = date('Y-m-d H:i:s');
     $agent_code_sql = $agent_code ? "'$agent_code'" : 'NULL';
     $notes_sql      = $notes      ? "'$notes'"      : 'NULL';
@@ -56,9 +60,12 @@ function createInsurer($conn, $input, $username, $company_id){
         VALUES ('$insurer_id', '$company_id', '$name', '$short_name', $agent_code_sql, $is_primary, 1, $notes_sql, '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
+        if ($is_primary) mysqli_commit($conn);
         jsonResponse(201, 'Insurer created successfully', ['insurer_id' => $insurer_id]);
     } else {
-        jsonResponse(500, 'Failed to create insurer', ['error' => mysqli_error($conn)]);
+        if ($is_primary) mysqli_rollback($conn);
+        error_log('createInsurer DB error: ' . mysqli_error($conn));
+        jsonResponse(500, 'Failed to create insurer');
     }
 }
 
@@ -133,6 +140,10 @@ function updateInsurer($conn, $insurer_id, $input, $username, $company_id){
     if (isset($input['is_primary'])) {
         $is_primary = !empty($input['is_primary']) ? 1 : 0;
         if ($is_primary) {
+            // Wrap the primary-flag reset + UPDATE in a transaction — same
+            // rationale as createInsurer: a failed UPDATE after the reset
+            // would leave the company with no primary insurer.
+            mysqli_begin_transaction($conn);
             mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".insurers SET is_primary = 0 WHERE company_id = '$company_id'");
         }
         $updates[] = "is_primary = $is_primary";
@@ -148,9 +159,12 @@ function updateInsurer($conn, $insurer_id, $input, $username, $company_id){
     $updates[] = "updated_at = '$now'";
 
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".insurers SET " . implode(', ', $updates) . " WHERE insurer_id = '$insurer_id' AND company_id = '$company_id'")) {
+        if (isset($is_primary) && $is_primary) mysqli_commit($conn);
         jsonResponse(200, 'Insurer updated successfully');
     } else {
-        jsonResponse(500, 'Failed to update insurer', ['error' => mysqli_error($conn)]);
+        if (isset($is_primary) && $is_primary) mysqli_rollback($conn);
+        error_log('updateInsurer DB error: ' . mysqli_error($conn));
+        jsonResponse(500, 'Failed to update insurer');
     }
 }
 
@@ -236,6 +250,8 @@ try {
         }
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

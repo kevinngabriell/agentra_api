@@ -31,7 +31,12 @@ class XlsxWriter {
 
     /** Set column widths. Keys are 0-based column indexes, values are width in characters. */
     public function setColWidths(array $widths): void {
-        $this->colWidths = $widths;
+        foreach ($widths as $idx => $w) {
+            if (!is_numeric($w) || $w < 0 || $w > 255) {
+                throw new InvalidArgumentException("Invalid column width for index $idx");
+            }
+        }
+        $this->colWidths = array_map('floatval', $widths);
     }
 
     /** Output XLSX directly to the HTTP response as a file download. */
@@ -40,7 +45,12 @@ class XlsxWriter {
         $tmpFile  = tempnam(sys_get_temp_dir(), 'xlsx_');
 
         $zip = new ZipArchive();
-        $zip->open($tmpFile, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+        if ($zip->open($tmpFile, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+            @unlink($tmpFile);
+            http_response_code(500);
+            echo json_encode(['status_code' => 500, 'status_message' => 'Failed to create XLSX archive']);
+            exit;
+        }
         $zip->addFromString('[Content_Types].xml',        $this->buildContentTypes());
         $zip->addFromString('_rels/.rels',                $this->buildRels());
         $zip->addFromString('xl/workbook.xml',            $this->buildWorkbook());
@@ -50,16 +60,22 @@ class XlsxWriter {
         $zip->addFromString('xl/worksheets/sheet1.xml',   $sheetXml);
         $zip->close();
 
-        $data = file_get_contents($tmpFile);
-        @unlink($tmpFile);
+        // Whitelist the filename so control chars / quotes / etc. can't break
+        // the Content-Disposition header parse. Also provide the RFC 5987
+        // `filename*` form so non-ASCII filenames survive round-tripping.
+        $safe = preg_replace('/[^\p{L}\p{N} _.\-]/u', '_', $filename);
+        if ($safe === '') $safe = 'export.xlsx';
 
         if (ob_get_level()) ob_end_clean();
         header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        header('Content-Disposition: attachment; filename="' . str_replace('"', '', $filename) . '"');
-        header('Content-Length: ' . strlen($data));
+        header('Content-Disposition: attachment; filename="' . $safe . '"; filename*=UTF-8\'\'' . rawurlencode($filename));
+        header('Content-Length: ' . filesize($tmpFile));
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Pragma: no-cache');
-        echo $data;
+        // readfile streams the file directly to output instead of loading it
+        // into a PHP string — peak memory is roughly the file size rather than 3x.
+        readfile($tmpFile);
+        @unlink($tmpFile);
         exit;
     }
 

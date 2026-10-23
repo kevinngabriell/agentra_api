@@ -2,11 +2,13 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
+require_once __DIR__ . '/statements.php';
+require_once __DIR__ . '/../helpers/subscription.php';
 
 // ─── CM-001: List all commissions ────────────────────────────────────────────
 function getAllCommissions($conn, $company_id, $params) {
     $page    = max(1, (int)($params['page']   ?? 1));
-    $limit   = min(100, max(1, (int)($params['limit'] ?? 10)));
+    $limit   = min(100, max(1, (int)($params['limit'] ?? 15)));
     $offset  = ($page - 1) * $limit;
 
     $where = "cm.company_id = '" . mysqli_real_escape_string($conn, $company_id) . "'";
@@ -22,6 +24,13 @@ function getAllCommissions($conn, $company_id, $params) {
     }
     if (!empty($params['month']) && preg_match('/^\d{4}-\d{2}$/', $params['month'])) {
         $where .= " AND DATE_FORMAT(p.coverage_start, '%Y-%m') = '" . $params['month'] . "'";
+    }
+    if (!empty($params['product_type'])) {
+        $where .= " AND p.product_type = '" . mysqli_real_escape_string($conn, $params['product_type']) . "'";
+    }
+    // [NEW v1.8.0] Only commissions not yet matched to an insurer statement.
+    if (!empty($params['unmatched'])) {
+        $where .= " AND NOT EXISTS (SELECT 1 FROM " . APP_SCHEMA . ".commission_statement_items csi WHERE csi.commission_id = cm.commission_id)";
     }
 
     $rows = mysqli_query($conn,
@@ -75,6 +84,9 @@ function getCommissionSummary($conn, $company_id, $params) {
     }
     if (!empty($params['month']) && preg_match('/^\d{4}-\d{2}$/', $params['month'])) {
         $where .= " AND DATE_FORMAT(p.coverage_start, '%Y-%m') = '" . $params['month'] . "'";
+    }
+    if (!empty($params['product_type'])) {
+        $where .= " AND p.product_type = '" . mysqli_real_escape_string($conn, $params['product_type']) . "'";
     }
 
     $result = mysqli_query($conn,
@@ -177,6 +189,13 @@ function markCommissionReceived($conn, $commission_id, $company_id, $input, $use
         return;
     }
 
+    $matched = mysqli_query($conn,
+        "SELECT 1 FROM " . APP_SCHEMA . ".commission_statement_items WHERE commission_id = '$cid' LIMIT 1");
+    if ($matched && mysqli_num_rows($matched) > 0) {
+        jsonResponse(400, 'This commission is matched to an insurer statement; unmatch it from the statement first');
+        return;
+    }
+
     if (!isset($input['received_amount']) || $input['received_amount'] === '') {
         jsonResponse(400, 'received_amount is required');
         return;
@@ -251,36 +270,68 @@ function markCommissionReceived($conn, $commission_id, $company_id, $input, $use
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
-$authUser   = requireAuth();
-$method     = $_SERVER['REQUEST_METHOD'];
-$company_id = $authUser['company_id'] ?? null;
-$username   = $authUser['user_id']    ?? $authUser['sub'] ?? null;
+// Wrap the entire dispatch in try/catch so an uncaught exception or DB
+// connection failure returns a JSON 500 instead of an HTML error page,
+// matching every other module's convention.
+try {
+    $authUser   = requireAuth();
+    $method     = $_SERVER['REQUEST_METHOD'];
+    $company_id = $authUser['company_id'] ?? null;
+    $username   = $authUser['user_id']    ?? $authUser['sub'] ?? null;
 
-if (!$company_id) {
-    jsonResponse(400, 'company_id is required');
-    exit;
-}
+    if (!$company_id) {
+        jsonResponse(400, 'company_id is required');
+        exit;
+    }
 
-// URL shape: /api/v1/commissions[/{commission_id}[/mark-received]]
-// $action     = $parts[3]  →  '' | 'summary' | commission_id
-// $sub_action = $parts[4]  →  '' | 'mark-received'
-$sub_action    = $parts[4] ?? '';
-$commission_id = (!empty($action) && $action !== 'summary') ? $action : null;
+    // URL shape: /api/v1/commissions[/{commission_id}[/mark-received]]
+    // $action     = $parts[3]  →  '' | 'summary' | commission_id
+    // $sub_action = $parts[4]  →  '' | 'mark-received'
+    $sub_action    = $parts[4] ?? '';
+    $commission_id = (!empty($action) && !in_array($action, ['summary', 'statements'], true)) ? $action : null;
 
-if ($action === 'summary') {
-    if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
-    getCommissionSummary($conn, $company_id, $_GET);
+    if ($action === 'statements') {
+        requirePlanFeature($conn, $company_id, 'commission_statements');
+        // /commissions/statements[/{id}[/match | /items/{commission_id}]]
+        $statement_id = $parts[4] ?? '';
+        $stmt_sub     = $parts[5] ?? '';
+        if ($statement_id === '') {
+            if ($method === 'GET')       listStatements($conn, $company_id, $_GET);
+            elseif ($method === 'POST')  createStatement($conn, $company_id, input(), $username);
+            else                         jsonResponse(405, 'Method Not Allowed');
+        } elseif ($stmt_sub === 'match') {
+            if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+            matchStatement($conn, $statement_id, $company_id, input(), $username);
+        } elseif ($stmt_sub === 'items' && !empty($parts[6])) {
+            if ($method !== 'DELETE') { jsonResponse(405, 'Method Not Allowed'); }
+            unmatchStatementItem($conn, $statement_id, $parts[6], $company_id);
+        } elseif ($stmt_sub === '') {
+            if ($method === 'GET')         getStatementDetail($conn, $statement_id, $company_id);
+            elseif ($method === 'DELETE')  deleteStatement($conn, $statement_id, $company_id);
+            else                           jsonResponse(405, 'Method Not Allowed');
+        } else {
+            jsonResponse(404, 'Route not found');
+        }
 
-} elseif ($commission_id && $sub_action === 'mark-received') {
-    if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
-    $input = json_decode(file_get_contents('php://input'), true) ?? [];
-    markCommissionReceived($conn, $commission_id, $company_id, $input, $username);
+    } elseif ($action === 'summary') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        getCommissionSummary($conn, $company_id, $_GET);
 
-} elseif ($commission_id) {
-    if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
-    getCommissionDetail($conn, $commission_id, $company_id);
+    } elseif ($commission_id && $sub_action === 'mark-received') {
+        if ($method !== 'PATCH') { jsonResponse(405, 'Method Not Allowed'); }
+        $input = input();
+        markCommissionReceived($conn, $commission_id, $company_id, $input, $username);
 
-} else {
-    if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
-    getAllCommissions($conn, $company_id, $_GET);
+    } elseif ($commission_id) {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        getCommissionDetail($conn, $commission_id, $company_id);
+
+    } else {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        getAllCommissions($conn, $company_id, $_GET);
+    }
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log('commissions dispatch exception: ' . $e->getMessage());
+    Response::internalError();
 }

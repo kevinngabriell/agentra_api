@@ -80,7 +80,11 @@ function exportPolicies($conn, $company_id, array $params): void {
     $where = "p.company_id = '$company_id'";
 
     if ($search) {
-        $where .= " AND (p.policy_number LIKE '%$search%' OR c.display_name LIKE '%$search%' OR c.company_legal_name LIKE '%$search%')";
+        // Escape LIKE wildcards after mysqli_real_escape_string — the latter
+        // does NOT escape % and _, which would let a user pass `%` to match
+        // ALL records or `_` for pattern-based enumeration.
+        $searchEsc = str_replace(['%', '_'], ['\%', '\_'], $search);
+        $where .= " AND (p.policy_number LIKE '%$searchEsc%' ESCAPE '\\\\' OR c.display_name LIKE '%$searchEsc%' ESCAPE '\\\\' OR c.company_legal_name LIKE '%$searchEsc%' ESCAPE '\\\\')";
     }
     if ($customer_id) {
         $where .= " AND p.customer_id = '$customer_id'";
@@ -123,28 +127,33 @@ function exportPolicies($conn, $company_id, array $params): void {
             p.net_commission_amount,
             p.customer_premium_amount,
             p.issuing_agent_id,
-            COALESCE(u.first_name, '') AS agent_name,
+            COALESCE(sa.full_name, u.first_name, '') AS agent_name,
             c.display_name AS customer_name,
             COALESCE(c.personal_email, c.company_email, c.pic_email, '') AS customer_email,
             COALESCE(c.personal_phone, c.company_phone, c.pic_phone, '') AS customer_phone,
             COALESCE(pp.policy_number, 'BARU') AS prev_policy_number
         FROM " . APP_SCHEMA . ".policies p
         LEFT JOIN " . APP_SCHEMA . ".customers c  ON c.customer_id = p.customer_id
+        LEFT JOIN " . APP_SCHEMA . ".sub_agents sa ON sa.sub_agent_id = p.issuing_agent_id
         LEFT JOIN " . CORE_SCHEMA . ".app_user u  ON u.user_id COLLATE utf8mb4_unicode_ci = p.issuing_agent_id
         LEFT JOIN " . APP_SCHEMA . ".policies pp  ON pp.policy_id  = p.previous_policy_id
         WHERE $where
-        ORDER BY COALESCE(u.first_name COLLATE utf8mb4_unicode_ci, ''), p.issuing_agent_id, p.coverage_start ASC
+        ORDER BY COALESCE(sa.full_name COLLATE utf8mb4_unicode_ci, u.first_name COLLATE utf8mb4_unicode_ci, ''), p.issuing_agent_id, p.coverage_start ASC
+        LIMIT 10000
     ";
 
     $result = mysqli_query($conn, $sql);
     if (!$result) {
-        jsonResponse(500, 'Export query failed', ['error' => mysqli_error($conn)]);
+        error_log('exportPolicies DB error: ' . mysqli_error($conn));
+        jsonResponse(500, 'Internal server error');
         return;
     }
 
     $policies = mysqli_fetch_all($result, MYSQLI_ASSOC);
     if (empty($policies)) {
-        jsonResponse(404, 'No policies found for export');
+        // Return 200 with empty data — 404 implies the collection itself doesn't exist,
+        // which is wrong for a filtered list that happens to return zero rows.
+        jsonResponse(200, 'No policies found for export', ['data' => []]);
         return;
     }
 

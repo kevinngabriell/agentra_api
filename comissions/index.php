@@ -245,6 +245,8 @@ try {
         }
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

@@ -1,5 +1,5 @@
 <?php
-// [NEW v1.1] One-off CLI helper to mint a long-lived service JWT for cron callers
+// CLI-only helper to mint a long-lived service JWT for cron callers
 // (e.g. the daily renewal-reminder scheduler hitting POST /api/v1/services/renewal-reminder).
 //
 // Usage:
@@ -8,11 +8,19 @@
 // Copy the printed token into the cron job's Authorization header:
 //   Authorization: Bearer <token>
 //
-// This reuses the existing JWT signing/verification path (helpers/jwt.php) —
-// no new secret or auth mechanism. requireAuth() accepts it like any other
-// access token; endpoints that need to recognize a service caller check for
-// `service === 'cron'` in the decoded payload (no company_id is embedded,
-// since cron jobs act across all companies).
+// SECURITY: This script MUST only run from the CLI. Web exposure would let
+// anyone mint a ~10-year service token. The guard below enforces this.
+
+if (php_sapi_name() !== 'cli') {
+    http_response_code(403);
+    header('Content-Type: application/json');
+    echo json_encode([
+        'status_code'    => 403,
+        'status_message' => 'Forbidden: this script can only be run from the CLI.',
+        'data'           => [],
+    ]);
+    exit;
+}
 
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/helpers/jwt.php';

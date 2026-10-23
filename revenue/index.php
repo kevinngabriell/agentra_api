@@ -60,15 +60,16 @@ function getRevenueSummary($conn, $company_id, $month) {
     // ── Per-agent breakdown ──────────────────────────────────────────────────
     $agentRes = mysqli_query($conn, "SELECT
             p.issuing_agent_id,
-            COALESCE(u.first_name, 'Main Agent') AS agent_name,
+            COALESCE(sa.full_name, u.first_name, 'Main Agent') AS agent_name,
             COUNT(*) AS policies_count,
             COALESCE(SUM(p.premium_amount), 0)       AS total_premium,
             COALESCE(SUM(p.commission_amount), 0)     AS total_commission_amount,
             COALESCE(SUM(p.net_commission_amount), 0) AS total_net_commission_amount
         FROM " . APP_SCHEMA . ".policies p
+        LEFT JOIN " . APP_SCHEMA . ".sub_agents sa ON sa.sub_agent_id = p.issuing_agent_id
         LEFT JOIN " . CORE_SCHEMA . ".app_user u ON u.user_id COLLATE utf8mb4_unicode_ci = p.issuing_agent_id
         WHERE $where
-        GROUP BY p.issuing_agent_id, u.first_name
+        GROUP BY p.issuing_agent_id, sa.full_name, u.first_name
         ORDER BY total_premium DESC");
 
     $byAgent = [];
@@ -127,6 +128,8 @@ try {
         jsonResponse(404, 'Route not found');
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

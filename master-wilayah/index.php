@@ -93,12 +93,18 @@ function getVillages($conn, $district_code) {
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 // /api/v1/master-wilayah/{action}
-//   provinces                        (no params)
-//   cities?province_code=xx
+//   provinces                        (no params, public)
+//   cities?province_code=xx          (public)
 //   districts?city_code=xx.xx
 //   villages?district_code=xx.xx.xx
 
-requireAuth();
+// provinces and cities are public reference data: the registration form
+// (no token yet) uses them for the optional province -> city picker.
+// districts and villages stay behind auth.
+$publicActions = ['provinces', 'cities'];
+if (!in_array($action, $publicActions, true)) {
+    requireAuth();
+}
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method !== 'GET') {
@@ -125,6 +131,8 @@ try {
             jsonResponse(404, 'Route not found');
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

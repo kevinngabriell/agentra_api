@@ -2,6 +2,126 @@
 
 ---
 
+## ⚠️ What's New — v1.5.0 Claims Management (Deploy: Action Required)
+
+> **Before deploying:** run `migration_claims.sql` **once** on the Agentra schema. It creates `claims` and `claim_events` and ALTERs `documents` (adds `claim_requirement`, adds the FK on `claim_id`). The ALTER is not idempotent. Requires `migration_documents.sql` (v1.4.0) first.
+
+A claim is registered against one policy; the customer comes from the policy. `claim_number` is generated per company (`CLM-{year}-{seq}`).
+
+**Status flow** (`status`, label in `status_label`)
+
+```
+reported → survey → documents_complete → approved → paid
+        ↘ (survey optional)            ↘ rejected → documents_complete (reopen)
+```
+
+| From | Allowed next |
+|---|---|
+| `reported` | `survey` · `documents_complete` · `rejected` |
+| `survey` | `documents_complete` · `rejected` |
+| `documents_complete` | `approved` · `rejected` |
+| `approved` | `paid` |
+| `rejected` | `documents_complete` |
+| `paid` | — (claim is locked) |
+
+**Rules**
+- `date_of_loss` must not be in the future and must fall inside the policy's `coverage_start`–`coverage_end` (422 `ERR_CLAIM_005`). Cancelled policies can't take claims (409 `ERR_CLAIM_006`).
+- `approved` needs `approved_amount` (> 0). `rejected` needs `rejection_reason`. `paid` needs `settlement_amount` (≤ `approved_amount`) and `payment_date`. Missing fields → 422 with `error.details.fields`.
+- Amounts are whole IDR. `deductible` is the *risiko sendiri* borne by the customer; the UI suggests `settlement = approved − deductible`.
+- `DELETE` only while `reported` and with no documents (soft delete).
+- Every registration, status change, edit, follow-up, note and document upload/delete is appended to the claim timeline (`claim_events`). Registration and status changes are also written to `policy_logs` (`claim_registered`, `claim_status_changed`, `claim_deleted`).
+- **Document checklist** depends on the policy's product (`car/motorcycle/kendaraan` → motor, `fire/kebakaran`, `cargo`, `travel`, `kecelakaan/aep`, otherwise a default list). Each item has `key`, `label`, `required`, `provided`. Upload claim files through `POST /documents` with `claim_id` (+ optional `claim_requirement` = checklist key); list them with `GET /documents?claim_id=`. Documents of an in-progress claim stay deletable and are not auto-archived even after the policy expires.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/claims` | Query: `status` (any status, or `open` = reported/survey/documents_complete/approved), `insurer_id`, `product_type`, `customer_id`, `policy_id`, `params` (claim no. / insurer claim no. / cause / customer / policy no.), `page`, `limit` (≤ 50, default 20). Rows add `docs_required` / `docs_provided` (required checklist items on file). |
+| POST | `/claims` | JSON: `policy_id`*, `date_of_loss`*, `cause`*, `loss_location`, `description`, `estimated_loss`, `deductible`, `reported_date` (default today), `insurer_claim_number`. → 201. |
+| GET | `/claims/summary` | `{ total, open, by_status{}, pending_documents, open_estimated, approved_unpaid, paid_total }`. `pending_documents` = claims in `reported`/`survey` whose required checklist items aren't all on file. |
+| GET | `/claims/stats` | `?customer_id=` or `?policy_id=` → `{ claim_count, open_count, rejected_count, paid_count, estimated_total, incurred_total, settled_total, premium_total, claim_ratio, last_claim_date }`. `claim_ratio` = incurred ÷ premium × 100 (incurred = settlement for paid, approved amount for approved; cancelled policies excluded from premium); `null` when premium is 0. |
+| GET | `/claims/{id}` | Claim + `checklist[]` + `events[]` (newest first). |
+| PUT | `/claims/{id}` | JSON, any of: `cause`, `loss_location`, `description`, `insurer_claim_number`, `surveyor_name`, `survey_date`, `estimated_loss`, `deductible`, `date_of_loss`, `reported_date`, plus `approved_amount` while `approved`. Not once `paid` (409 `ERR_CLAIM_010`). |
+| PUT | `/claims/{id}/status` | JSON: `status`*, `note`, `insurer_claim_number`; per status: `survey` → `surveyor_name`, `survey_date`; `approved` → `approved_amount`*, `deductible`; `rejected` → `rejection_reason`*; `paid` → `settlement_amount`*, `payment_date`*. Invalid move → 409 `ERR_CLAIM_009`. |
+| POST | `/claims/{id}/events` | JSON: `description`*, `event_type` (`followup` default · `note`), `channel` (`whatsapp` · `phone` · `email` · `in_person` · `insurer`), `event_date` (default today, may be back-dated). Returns the claim detail. |
+| DELETE | `/claims/{id}` | Soft delete. 409 `ERR_CLAIM_012`. |
+
+**Also changed in v1.5.0**
+- `GET /dashboard/stats` adds `open_claims` and `claims_pending_documents`.
+- `GET /renewals` rows add `claim_count` and `claims_incurred` (for the policy being renewed).
+- `GET /documents` accepts `claim_id`; documents have `claim_id` and `claim_requirement`. `POST /documents` accepts `claim_id` (policy and customer are taken from the claim) and `claim_requirement` (400 `ERR_DOC_021` if not a checklist key for that product).
+
+Claim object (list rows omit `checklist` / `events`):
+
+```json
+{
+  "claim_id": "clm_3f9c1d2a8b7e6f504a11", "claim_number": "CLM-2026-0001", "insurer_claim_number": null,
+  "policy_id": "pol_…", "policy_number": "0212345678", "product_type": "car", "object_insured": "Toyota Avanza B 1234 XYZ",
+  "coverage_start": "2026-03-01", "coverage_end": "2027-03-01", "premium_amount": 4500000, "sum_insured": 220000000,
+  "insurer_id": "ins_…", "insurer_name": "PT Asuransi Contoh", "insurer_short_name": "ACO",
+  "customer_id": "cust_…", "customer_name": "Oki Wijaya", "customer_type": "individual",
+  "date_of_loss": "2026-10-12", "reported_date": "2026-10-13", "cause": "Tabrakan", "loss_location": "Jl. Sudirman, Jakarta",
+  "description": "Ditabrak dari belakang saat berhenti di lampu merah.",
+  "estimated_loss": 8500000, "deductible": 300000, "approved_amount": null, "settlement_amount": null, "payment_date": null,
+  "status": "reported", "status_label": "Dilaporkan", "status_changed_at": "2026-10-13 09:12:00",
+  "surveyor_name": null, "survey_date": null, "rejection_reason": null,
+  "created_by": "usr_…", "created_by_name": "Kevin Gabriel", "created_at": "2026-10-13 09:12:00", "updated_at": "2026-10-13 09:12:00",
+  "docs_required": 7, "docs_provided": 0
+}
+```
+
+Error codes: `ERR_CLAIM_001`–`017`, `ERR_DOC_020`, `ERR_DOC_021`.
+
+---
+
+## ⚠️ What's New — v1.4.0 Document Management (Deploy: Action Required)
+
+> **Before deploying:** run `migration_documents.sql` on the Agentra schema (creates `documents`; additive only), and set `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` in `.env` (same Cloudeka bucket as xlab-backend / erpAPI v2 — see `.env.example`). Uploads allow 10 MB files: make sure PHP's `upload_max_filesize` ≥ 12M and `post_max_size` ≥ 14M (`.user.ini` sets this for PHP-FPM; mod_php needs it in php.ini).
+
+Files are stored in Cloudeka S3 under `agentra/` (production) or `agentra-dev/` (other envs) → `{company_id}/documents/{customer_id}/{uuid}.{ext}`. The API never returns the object key; browsers get a 5-minute presigned link from `GET /documents/{id}/url`.
+
+**Rules**
+- Every document belongs to a customer. `policy_id` is optional; when given, the customer is taken from the policy. (`claim_id` is reserved for the claims module.)
+- Accepted: PDF, JPG, PNG — checked by file content, not extension. Max 10 MB.
+- `document_type`: `policy` · `endorsement` · `sppa` · `ktp` · `npwp` · `nib` · `akta_pendirian` · `survey_photo` · `claim` · `payment_proof` · `other`.
+- `document_year` defaults to the policy's `coverage_start` year, else the upload year.
+- **Audit trail:** nothing is hard-deleted. `DELETE` soft-deletes (row and object kept). Documents of an **expired policy** (`coverage_end` < today) cannot be deleted — archive them. Archived documents can't be deleted or edited (restore first). Policies and customers that have documents can no longer be hard-deleted (409).
+- Uploads/deletes on a policy document are written to `policy_logs` (`document_uploaded` / `document_deleted`).
+- **KYC (APU-PPT):** individual → `ktp`; company → `akta_pendirian`, `nib`, `npwp`, `ktp` (director/PIC). Archived documents still count.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/documents` | Query: `customer_id`, `policy_id`, `insurer_id`, `document_type`, `year`, `status` (`active` default · `archived` · `all`), `params` (search title / file name / customer / policy no.), `page`, `limit` (≤ 50, default 20). Always 200 — empty `data` when nothing matches. |
+| POST | `/documents` | `multipart/form-data`: `file`*, `document_type`*, `customer_id` or `policy_id`*, `title`, `notes`, `document_year`. → 201 with the document. |
+| GET | `/documents/summary` | `{ total, active, archived, by_type, years[], expired_policy_active, kyc_incomplete }` |
+| GET | `/documents/kyc` | Customers' KYC status. Query: `kyc` (`incomplete` default · `complete` · `all`), `params`, `include_inactive=true`, `page`, `limit`. Rows: `{ customer_id, display_name, customer_type, status, required[], present[], missing[], complete }` |
+| GET | `/documents/kyc/{customer_id}` | One customer's KYC status (same row shape). |
+| POST | `/documents/archive-expired` | Archives every active document whose policy has ended → `{ archived: n }`. Idempotent; safe for a cron. |
+| GET | `/documents/{id}` | Detail. |
+| PUT | `/documents/{id}` | JSON: `document_type`, `title`, `notes`, `document_year`. Active documents only. |
+| GET | `/documents/{id}/url` | `?disposition=inline` (preview, default) or `attachment` (download) → `{ url, expires_in: 300, mime_type, file_name }` |
+| PUT | `/documents/{id}/archive` | JSON: `reason` (optional). |
+| PUT | `/documents/{id}/unarchive` | Restore. |
+| DELETE | `/documents/{id}` | Soft delete. 409 `ERR_DOC_011` (expired policy) / `ERR_DOC_012` (archived). |
+
+Document object:
+
+```json
+{
+  "document_id": "doc_72f105497075ad1dd41b",
+  "customer_id": "cust_6a32359a4fc45", "customer_name": "Oki Wijaya", "customer_type": "individual",
+  "policy_id": null, "policy_number": null, "product_type": null, "coverage_end": null,
+  "insurer_id": null, "insurer_short_name": null, "claim_id": null,
+  "document_type": "ktp", "title": "KTP Oki", "notes": null, "document_year": 2026,
+  "file_name": "ktp oki.pdf", "mime_type": "application/pdf", "file_size": 193,
+  "status": "active", "archived_at": null, "archive_reason": null,
+  "uploaded_by": "614442bc-…", "uploaded_by_name": "Kevin Gabriel", "uploaded_at": "2026-10-21 15:15:52",
+  "policy_expired": false
+}
+```
+
+Errors: `ERR_DOC_001`–`ERR_DOC_019` in `helpers/ErrorCode.php` (e.g. `ERR_DOC_003` 413 too large, `ERR_DOC_004` unsupported type, `ERR_DOC_009` policy belongs to another customer, `ERR_DOC_015` 503 storage unavailable).
+
+---
+
 ## ⚠️ What's New — v1.3.0 (FE Team: Action Required)
 
 > No SQL migration on the Agentra schema — this reads reference tables that are already populated in the shared core schema (`movira_core_dev`). Nothing to run before deploying.
@@ -216,6 +336,23 @@ Two new endpoints on `/api/v1/policies/{policy_id}`:
 
 See [Section 6.4b](#64b-direct-update-policy-without-endorsement) and [Section 6.4c](#64c-delete-policy) for full details.
 
+### Corrections vs endorsements (v1.10.0)
+
+A change to an issued policy is either a **correction** (the agent fixed their own input mistake) or an **endorsement** (the insurer changed the contract). Body fields, accepted by `PATCH /policies/{id}`, `PUT /policies/{id}`, and `POST` / `PUT` / `DELETE` on `/policies/{id}/coverages[/{coverage_id}]` and `/policies/{id}/terms[/{term_id}]`:
+
+| Field | Notes |
+|---|---|
+| `change_kind` | `correction` or `endorsement`. Default: `correction` on `PATCH` (forced), `endorsement` everywhere else (unchanged behaviour). |
+| `reason` | Required for a correction (5-500 chars). Optional note for an endorsement. |
+| `endorsement_number`, `effective_date` | Endorsement only, both optional (`YYYY-MM-DD`). Kept in the log metadata. |
+
+- A correction is logged as `policy_updated` with `metadata.kind = "correction"` and `metadata.reason`; an endorsement stays `endorsement`. No new event type and no migration.
+- `PATCH` accepts `customer_id` (wrong nasabah chosen): the customer must exist in the company; the policy's documents move with it; the log metadata holds `customer_from` / `customer_to`.
+- `sum_insured` and `premium_amount` are derived from the coverage items. When a policy has items, both are ignored on `PUT` / `PATCH`; change the items instead. Values equal to the stored ones are dropped, so only real changes are logged.
+- **Lock:** a correction of `customer_id`, money fields, or coverage items returns `409 ERR_CHG_003` once the policy is paid (or has a paid instalment), has a non-deleted claim, or has been renewed. Use an endorsement then. Dates and descriptive fields stay correctable, and terms (risiko sendiri / klausula / perluasan) are not locked.
+- `POST /policies` accepts `terms` (see Policy Terms) and they are not logged as endorsements.
+- New errors: `ERR_CHG_001` bad `change_kind`, `ERR_CHG_002` reason missing, `ERR_CHG_003` locked, `ERR_CHG_004/005` invalid / too long field, `ERR_CHG_006` customer not found.
+
 ---
 
 ## ⚠️ What's New — v1.1 (FE Team: Action Required)
@@ -378,7 +515,7 @@ No auth required.
 | password_confirmation | string | Yes | Must match password |
 | phone | string | Yes | Phone number |
 | business_name | string | Yes | Company/agency name |
-| city | string | Yes | City |
+| city | string | No | City (optional at signup; pick from `/master-wilayah/cities`) |
 | plan | string | Yes | Plan ID from `/plans` |
 | app_id | string | No | Application ID |
 | app_role_id | string | No | Role ID |
@@ -1822,6 +1959,19 @@ All endpoints require `Authorization: Bearer <access_token>`.
 
 **GET** `/api/v1/master-products`
 
+> **[NEW] `product_type`** — every product now belongs to one fixed insurance line (`fire`, `earthquake`, `motor`, `cargo`, `travel`, `personal_accident`, `liability`, `engineering`, `marine_hull`, `health`, `bonds`, `others`). Users still define their own products (code, name, commission, prefixes) but must pick a type. The type decides the policy risk form and its options. **Deploy:** run `migration_product_types.sql` first, review the backfill, then handle any rows still `NULL`.
+>
+> **`GET /master-products/types`** returns the list for the product form dropdown and the per-type form options, so the policy form should render from it instead of hardcoding:
+> ```json
+> { "data": { "data": [
+>   { "product_type": "fire", "label": "Kebakaran / PAR", "risk_group": "fire", "has_risk_details": true,
+>     "options": { "survey_status": ["not_required","pending","scheduled","done"], "construction_class": ["I","II","III"] } },
+>   { "product_type": "motor", "label": "Kendaraan Bermotor", "risk_group": "motor", "has_risk_details": true,
+>     "options": { "vehicle_usage": ["private","commercial"], "motor_coverage_type": ["comprehensive","tlo"] } }
+> ] } }
+> ```
+> Show `construction_class` on the policy form only when the product's type lists it in `options`. `POST /master-products` requires `product_type` (400 otherwise); `PUT` accepts it. List/detail return it (`null` until backfilled).
+
 **Response `200`:**
 ```json
 {
@@ -1875,6 +2025,7 @@ All endpoints require `Authorization: Bearer <access_token>`.
 |---|---|---|---|
 | `product_code` | string | Yes | Unique code per company (stored as `product_type` on policies). Lowercase. |
 | `product_name` | string | Yes | Human-readable name |
+| `product_type` | string | **Yes** ⭐ NEW | One of the fixed types from `GET /master-products/types` |
 | `commission_rate` | float | Yes | Default commission % (0–100) |
 | `default_tax_rate` | decimal | **No** ⭐ NEW | Default PPh rate as decimal 0–1 (e.g. `0.025` = 2.5%). Default: `0.025`. Auto-fills `commission_tax_rate` on new policies. |
 | `policy_prefixes` | string | No | Comma-separated policy number prefixes for auto-detection (e.g. `01,08,88,61,62`) |
@@ -1947,7 +2098,7 @@ Cascading Province → City (Regency) → District → Village lookup for Indone
 
 **Base path:** `/api/v1/master-wilayah`
 
-All endpoints are `GET` and require `Authorization: Bearer <access_token>`.
+All endpoints are `GET`. `provinces` and `cities` are public (no token) so the registration form can use them; `districts` and `villages` require `Authorization: Bearer <access_token>`.
 
 ---
 
@@ -2679,6 +2830,21 @@ Returns a single commission record with full policy, customer, and insurer conte
 
 ---
 
+### CM-005 — Insurer statements (reconciliation)
+
+Run `migration_commission_statements.sql` once. A statement is one payment received from an insurer; commissions are matched against it. `GET /commissions` and `/commissions/summary` also accept `product_type`, and `GET /commissions` accepts `unmatched=1` (only commissions not on a statement).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/commissions/statements` | List (`insurer_id`, `month=YYYY-MM`, `page`, `limit`) |
+| POST | `/commissions/statements` | Record a statement: `insurer_id`, `statement_date`, `amount` (IDR), optional `reference_number`, `notes`, `items` |
+| GET | `/commissions/statements/{id}` | Statement plus its matched commissions |
+| POST | `/commissions/statements/{id}/match` | `items: [{commission_id, allocated_amount?}]`; `allocated_amount` defaults to the commission's `expected_amount` |
+| DELETE | `/commissions/statements/{id}/items/{commission_id}` | Unmatch one commission (back to `pending`) |
+| DELETE | `/commissions/statements/{id}` | Delete the statement and unmatch everything |
+
+Each statement carries `matched_count`, `matched_amount`, `unmatched_amount` (`amount − matched_amount`) and `discrepancy_count` (matched commissions where `|allocated − expected| > 1`). Matching requires the commission to belong to the statement's insurer, not be cancelled or already matched, and the allocations not to exceed the statement amount (400 otherwise). A matched commission gets the statement's date and reference and status `received`/`discrepancy`; `PATCH …/mark-received` on it returns 400 until it is unmatched.
+
 ### CM-004 — Mark Commission as Received
 
 **PATCH** `/api/v1/commissions/{commission_id}/mark-received`
@@ -2868,3 +3034,256 @@ Sends each issuing agent a WhatsApp digest listing their policies entering the r
 | `send_failures[]` | Per-agent failures — no WhatsApp number on file, invalid number, or the WAHA send itself failing. These policies remain un-stamped and are retried on the next run. |
 
 Every send (success or failure) is also logged to `whatsapp_digest_logs` with `digest_type = "renewal_reminder"`, alongside the existing daily/monthly digest audit trail.
+
+
+---
+
+## Premium Payments (v1.6.0)
+
+Run `migration_payments.sql` first. Rules live in `helpers/payments.php`; endpoints in `policies/payments.php`.
+
+A policy's due date is `payment_due_date`, or `coverage_start + 30 days` when it is NULL (premium payment warranty). A policy with an instalment schedule is due on its next unpaid instalment. Urgency, from days until due: `due_soon` (0–7), `overdue` (past due), `cancellation_risk` (more than 14 days past due), otherwise `upcoming`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/policies/{id}/payments` | Due date, payment record and instalments (`expected_amount`, `effective_due_date`, `urgency`, `installments[]`) |
+| PUT | `/policies/{id}/payments` | Body `payment_due_date` (`null` resets to default) and/or `installments: [{due_date, amount}]` (2–12 rows, summing to `expected_amount`; `[]` clears). Not allowed once an instalment is paid (`ERR_PAY_006`) |
+| POST | `/policies/{id}/payments/{installment_id}/pay` | Body `payment_date` (default today, not in the future), `payment_reference`. The policy becomes `paid` with the last instalment |
+| PATCH | `/policies/{id}/payment-status` | Now also accepts `payment_date` and `payment_reference` with `paid`; moving back to `unpaid` clears them. Blocked while instalments are open (`ERR_PAY_011`) |
+| GET | `/policies/overdue-premiums?scope=attention\|overdue\|due_soon\|all` | Unpaid policies with `due_date`, `amount_due`, `days_until_due`, `urgency`, customer `whatsapp`, plus `summary` counts and amounts |
+
+
+---
+
+## Product-Specific Risk Details (v1.8.0)
+
+Run `migration_policy_risk_details.sql` first (new tables only). Rules live in `helpers/risk_details.php`; endpoints in `policies/risk_details.php`. Errors are `ERR_RISK_001`–`ERR_RISK_013`.
+
+A policy belongs to one **risk group**, derived from its product code (a `01` policy number prefix means `fire`, as for the construction class). Each group accepts only its own fields; others are ignored.
+
+| Group | Product codes | Fields |
+|---|---|---|
+| `motor` | `car`, `motorcycle` | `plate_number`, `chassis_number`, `engine_number`, `vehicle_make`, `vehicle_model`, `vehicle_year`, `vehicle_color`, `vehicle_usage` (`private`\|`commercial`), `motor_coverage_type` (`comprehensive`\|`tlo`), `vehicle_value`, `tariff_region` (1–3, OJK); extensions `ext_flood`, `ext_earthquake`, `ext_rsmdcc`, `ext_terrorism` (booleans), `tpl_limit`, `pa_driver_limit`, `pa_passenger_limit` + `pa_passenger_seats` (IDR; null = not taken) |
+| `cargo` | `cargo` | `conveyance_name`, `voyage_from`, `voyage_to`, `bl_awb_number`, `departure_date`, `icc_clause` (`A`\|`B`\|`C`), `goods_description`, `is_open_cover` |
+| `travel` | `travel` | `destinations` (comma-separated), `schengen_certificate_no`; travellers in `members`. Trip dates are the policy `coverage_start`/`coverage_end` |
+| `pa` | `kecelakaan`, `aep` | No detail row; `members` only |
+| `fire` | `fire` or `01…` number | `occupation_code`, `occupation_description`, `survey_status` (`not_required`\|`pending`\|`scheduled`\|`done`), `survey_date`, `ext_flood`, `ext_earthquake`, `ext_rsmdcc`, `ext_terrorism` |
+
+Other products have no risk details (`risk_group: null`; writes answer `422 ERR_RISK_002`). Plate, chassis, engine and B/L values are stored upper-case. Amounts are whole IDR. Dates are `YYYY-MM-DD`.
+
+`members` (travel: role `traveller`; pa: `insured` and `beneficiary`): `{member_role, full_name, id_number, birth_date, relationship}` plus, for travellers and insured people, `benefit_death`, `benefit_disability`, `benefit_medical` (IDR), and for beneficiaries `share_percent` (all shares together ≤ 100).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/policies/{id}/risk-details` | `{policy_id, product_type, risk_group, details, members}`. `details` holds only the group's fields (booleans typed), `null` until first saved |
+| PUT | `/policies/{id}/risk-details` | Body `{risk_details?, members?}`. `risk_details` replaces the stored row (unsent fields become empty); `members` replaces the whole list. Logs `policy_updated` with the changed fields. Returns the same shape as GET |
+| POST | `/policies` | Also accepts `risk_details` and `members`; saved in the same transaction as the policy |
+| POST | `/policies/{id}/renew` | Copies details and members to the new policy year (cargo `bl_awb_number` and `departure_date` are not copied) |
+| GET | `/policies?search=` | Now also matches plate (ignoring spaces and dashes), chassis, engine and B/L / AWB numbers, including those on declarations. List rows gain `plate_number`, `chassis_number`, `bl_awb_number` |
+
+### Cargo open cover declarations
+
+For `cargo` policies with `is_open_cover = true` (otherwise `409 ERR_RISK_009`). A declaration is one shipment under the master policy. Declarations are informational: they do not change the policy's premium or sum insured.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/policies/{id}/declarations` | `{items[], total_sum_insured, total_premium}`, newest first |
+| POST | `/policies/{id}/declarations` | Body `declaration_date` (default today), `conveyance_name`, `voyage_from`, `voyage_to`, `bl_awb_number`, `departure_date`, `goods_description`, `sum_insured`, `premium_amount`, `notes`. Returns `declaration_id` |
+| PUT | `/policies/{id}/declarations/{declaration_id}` | Same body; replaces the declaration |
+| DELETE | `/policies/{id}/declarations/{declaration_id}` | Removes it |
+
+Sub-agent logins cannot reach these routes (`helpers/access.php` allow-list).
+
+## Deductibles, Clauses and Extensions (v1.9.0)
+
+Run `migration_policy_terms.sql` first (new table only). Rules live in `helpers/policy_terms.php`; endpoints in `policies/terms.php`. Errors are `ERR_TERM_001`–`ERR_TERM_013`.
+
+One row in `policy_terms` is a **deductible** (*risiko sendiri*), a **clause** or an **extension**. `coverage_id` null means the term applies to the whole policy; set, it applies to that coverage item only (deleting the item deletes its terms).
+
+| Field | Notes |
+|---|---|
+| `term_type` | `deductible` \| `clause` \| `extension`. Cannot change after creation (`409 ERR_TERM_013`) |
+| `title` | Required for clauses and extensions. Deductibles default to "Risiko Sendiri" |
+| `clause_code` | Optional code of the entry picked from the web catalog (`components/policy-terms/catalog.ts`); null for free text. Not validated server-side |
+| `description` | Wording or explanation, up to 4000 characters |
+| `deductible_type` | Deductibles only: `fixed` (needs `deductible_amount`), `percent_claim` or `percent_sum_insured` (need `deductible_percent`, 0–100; `deductible_amount` is then the optional minimum) |
+| `coverage_id` | Must belong to the same policy (`422 ERR_TERM_009`) |
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/policies/{id}/terms` | `{items[]}` ordered deductibles, clauses, extensions; each row carries `coverage_type` and `coverage_label` |
+| POST | `/policies/{id}/terms` | Adds a term, returns it. At most 200 per policy. Logged as an `endorsement` |
+| PUT | `/policies/{id}/terms/{term_id}` | Replaces the term's fields (omitted fields keep their value). Logged as an `endorsement` |
+| DELETE | `/policies/{id}/terms/{term_id}` | Removes it. Logged as an `endorsement` |
+| POST | `/policies/{id}/renew` | Copies all terms to the new policy year, re-pointing per-coverage terms at the copied items |
+
+Sub-agent logins cannot reach these routes (`helpers/access.php` allow-list).
+
+## Prospects and Quotes (v1.10.0)
+
+Run `migration_prospects_quotes.sql` first (new tables only). Rules live in `helpers/sales.php`; endpoints in `prospects/index.php` and `quotes/index.php`. Errors are `ERR_SALES_*` and `ERR_QUOTE_*`. Sub-agent logins cannot reach these routes.
+
+### Prospects
+
+`prospect_type` is `lead` or `competitor_policy` (a policy held elsewhere, with `competitor_insurer`, `competitor_policy_number`, `competitor_expiry` required, `competitor_premium`). Stages: `new`, `contacted`, `quoted`, `negotiating`, `won`, `lost`. A `lost` prospect needs `lost_reason`: `price`, `competitor`, `no_longer_needed`, `no_response`, `other` (plus optional `lost_note`). `won` is only reachable through convert.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/prospects` | List. Filters `prospect_type`, `stage` (a stage or `open`), `product_interest`, `source`, `expiring_within` (days, competitor policies), `params` (search), `page`, `limit` (max 50) |
+| POST | `/prospects` | Body `prospect_type`, `name` (required), `contact_name`, `phone`, `whatsapp`, `email`, `source`, `referred_by_agent_id`, `product_interest`, `expected_premium`, `follow_up_date`, competitor fields, `notes` |
+| GET | `/prospects/summary` | `by_stage`, `open`, `open_expected_premium`, `win_rate`, `competitor_expiring_30/90`, `competitor_past_expiry`, `lost_by_reason` |
+| GET | `/prospects/{id}` | Detail with its `quotes` |
+| PUT | `/prospects/{id}` | Edit (type cannot change) |
+| DELETE | `/prospects/{id}` | Soft delete with its quotes; `409` once converted |
+| PUT | `/prospects/{id}/stage` | Body `{stage, lost_reason?, lost_note?}` |
+| POST | `/prospects/{id}/convert` | Body `{customer_id}`. Links an existing customer (the web app creates one first when needed) and sets the stage to `won` |
+
+### Quotes
+
+A quote holds product, `sum_insured`, optional period and `valid_until`, and 1–6 **options**, one per insurer, shown side by side. An option's premium is `sum_insured × rate_permille ÷ 1000` unless `premium_amount` is sent. `total_amount` = premium + `biaya_polis` + `materai_amount`. Status flow: `draft` → `sent` → `declined`; a declined quote can be reopened as `draft`; `accepted` is set through accept. A `sent` quote past `valid_until` is returned with `is_expired: true` (not a stored status). Numbers are `QT-{year}-{seq}`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/quotes` | List. Filters `status`, `prospect_id`, `product_type`, `params`, `page`, `limit` |
+| POST | `/quotes` | Body `prospect_id`, `product_type`, `sum_insured`, `object_description`, `coverage_start`, `coverage_end`, `valid_until`, `notes`, `options[]` (`insurer_id`, `rate_permille`, `premium_amount`, `biaya_polis`, `materai_amount`, `deductible_note`, `terms_note`). Moves a `new`/`contacted` prospect to `quoted` |
+| GET | `/quotes/{id}` | Detail with `options` |
+| PUT | `/quotes/{id}` | Edit while `draft` or `sent`. Sending `options` replaces them; changing `sum_insured` requires sending them |
+| DELETE | `/quotes/{id}` | Soft delete; not once accepted |
+| PUT | `/quotes/{id}/status` | Body `{status}`: `sent`, `draft` or `declined` |
+| POST | `/quotes/{id}/accept` | Body `{option_id}`. Sets `accepted_option_id` |
+| POST | `/quotes/{id}/policy` | Body `{policy_id}`. Links the policy issued from an accepted quote |
+
+The web app turns an accepted quote into a policy by opening `/agentra/policies/new?customer_id=…&quote_id=…`, which prefills the form from the accepted option and calls `POST /quotes/{id}/policy` after the policy is created. The quote PDF is the browser's print-to-PDF of `/agentra/quotes/{id}`; WhatsApp opens a prefilled wa.me message for the agent to send.
+
+## Renewal Quote Workflow (v1.11.0)
+
+Run `migration_renewal_workflow.sql` first (new tables only). Rules live in `helpers/renewal_workflow.php`; endpoints in `renewals/index.php`. Errors are `ERR_RWF_*`. A policy with no workflow row is `not_started`.
+
+Stages: `not_started` → `terms_requested` → `terms_received` → `offered` → `accepted` → `issued`. Allowed moves: `terms_received` can go back to `terms_requested`; `offered` back to `terms_received`; `accepted` back to `offered`; `declined` is reachable from every open stage and can be reopened to `terms_requested`. `issued` is only set by `POST /policies/{id}/renew` (which now moves the workflow to `issued` and stores `renewed_policy_id`), never by hand.
+
+Declining needs `lost_reason` (`price`, `competitor`, `service`, `no_longer_needed`, `asset_sold`, `no_response`, `other`) and marks a `pending` policy `lapsed`; reopening puts a `lapsed` policy back to `pending`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/renewals/{policy_id}/workflow` | `policy` (the old terms, including line-item count and current clauses/deductibles), `workflow` (stage and the proposed terms), `allowed_next`, `review_kind` (`vehicle_depreciation` for motor, `property_values` for fire, else `null`) and the `events` timeline |
+| PUT | `/renewals/{policy_id}/workflow` | Save the insurer's terms. Only fields sent change: `insurer_reference`, `new_sum_insured`, `new_premium`, `new_commission_rate`, `new_terms_notes`, `sum_insured_reviewed`, `review_note`. `409` once the policy is renewed or cancelled |
+| PUT | `/renewals/{policy_id}/workflow/stage` | Body `{stage, note?, lost_reason?, lost_note?}` |
+
+`GET /renewals` rows gain `workflow_stage` and `lost_reason`, and accept a `workflow_stage` filter. `GET /renewals/stats` gains `lost_reasons` (reason → count for the month). When the policy has line items, `POST /policies/{id}/renew` copies them and derives sum insured and premium from the copy, so `new_sum_insured` and `new_premium` only feed the renewal for policies without line items.
+
+## Customer 360 and Customer Groups (v1.11.0)
+
+Run `migration_customer_360.sql` first (adds `customer_groups` and `customers.group_id`; the ALTER is not idempotent). Rules live in `helpers/customer_360.php`. Errors are `ERR_CGRP_*`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/customers/{id}/overview?scope=customer\|group` | Every policy of the customer, or of its whole group, with `standing` (`in_force`, `upcoming`, `expired`, `cancelled`), plus `held` totals, `by_product`, `by_insurer` and the group `members`. Capped at 500 policies |
+| GET | `/customers/{id}/cross-sell?scope=customer\|group` | `suggestions[]`: `{family, because, reason, products[]}`. A rule fires when the customer holds a product family and lacks another (motor → fire / personal accident, fire → cargo / liability / personal accident, cargo → fire / liability, travel → personal accident, liability → fire). Only products that exist in the company's active `master_products` and are not already held are offered; the family comes from the product code (`helpers/risk_details.php`) or, failing that, keywords in the product name |
+| PUT | `/customers/{id}/group` | Body `{group_id}` to join a group, `{group_name}` to create-or-join by name, or neither to leave. `GET /customers/{id}` now returns `group_id` and `group_name` |
+| GET / POST | `/customer-groups` | List with `member_count`, `in_force_policies`, `premium` / create `{name, notes?}` |
+| GET / PUT / DELETE | `/customer-groups/{id}` | Group with members / rename / delete (members are ungrouped, not deleted) |
+
+## Customer Communication (v1.11.0)
+
+Run `migration_communications.sql` first (new tables only). Helpers in `helpers/messaging.php`; endpoints in `communications/index.php`; the daily job is `notification/greetings.php`. Errors are `ERR_MSG_*`. Messages go out through the same WAHA gateway as the renewal reminder, and every attempt (sent or failed) is written to `message_log`, including renewal reminders sent through `POST /renewals/{id}/send-whatsapp`.
+
+Template placeholders: `{customer_name}`, `{policy_number}`, `{product_type}`, `{insurer_name}`, `{coverage_end}`, `{days_until_expiry}`, `{premium_amount}`, `{amount_due}`, `{due_date}`. Policy placeholders show `-` when no policy is given. URLs inside customer-entered values are replaced with `[link]`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/communications/templates?type=` | Template library plus the `placeholders` list. Default templates (payment reminder, invoice, birthday, holiday, broadcast) are created the first time a company opens it |
+| POST / PUT / DELETE | `/communications/templates[/{id}]` | `template_type` (`invoice`, `payment_reminder`, `birthday`, `holiday`, `broadcast`, `custom`), `name`, `body`, and for greetings `auto_send`; a holiday also has `send_on_date` and `repeat_yearly` |
+| POST | `/communications/preview` | `{customer_id, policy_id?, template_id? \| body}` → the rendered text, nothing sent |
+| POST | `/communications/send` | Same body, plus `message_type`. Sends to the customer's WhatsApp number (the PIC number for companies). `invoice` and `payment_reminder` need `policy_id`. `502` when the gateway refuses; the failure is still logged |
+| GET | `/communications/log` | Filters `customer_id`, `policy_id`, `message_type`, `status`, `page`, `limit` (max 50) |
+| POST | `/communications/broadcast/preview` | `{filters}` → `matched`, `reachable`, `no_whatsapp`, `sample` |
+| POST | `/communications/broadcast` | `{name, template_id? \| body, filters}`. Max 100 reachable recipients per broadcast (`ERR_MSG_009`); sends one by one with a short pause |
+| GET | `/communications/broadcasts` | History with sent and failed counts |
+
+Segment `filters`: `product_type`, `insurer_id`, `city` (matches the policy's risk city), `customer_type`, `group_id`. A segment is active customers; the product, insurer and city filters need a policy in force that meets all of them.
+
+**Greetings job** (`php notification/greetings.php [--dry-run]`, CLI only, run daily): sends every `auto_send` birthday template to individual customers whose birthday is today (29 Feb is greeted on 28 Feb in a common year), and every `auto_send` holiday template to all active customers on its date. A customer gets a template at most once per calendar year; a failed send is logged and tried again on the next run. Cron: `0 8 * * * /usr/bin/php8.3 /home/ubuntu/apps/agentra_api/notification/greetings.php >> /var/log/agentra_greetings.log 2>&1`.
+
+## Reports, Renewal Calendar, Notifications and Tasks (v1.12.0)
+
+Run `migration_notifications_tasks.sql` first (new tables only, idempotent). Sub-agent logins cannot reach any of these routes.
+
+### Reports
+
+`GET /reports/{report}` answers `{title, columns[{key,label,type}], rows[], totals?}` where `type` is `text`, `int`, `money`, `pct` or `date`. Add `format=xlsx` to download the same table as Excel. Common filters: `year` (default this year), `insurer_id`.
+
+| Report | Extra filters | Purpose |
+|---|---|---|
+| `payment-consolidation` | `month` | Premium per insurer split into unpaid / paid / confirmed |
+| `lapsed` | | Policies with `renewal_status = lapsed` that ended in the year |
+| `portfolio` | | In-force policies by product and insurer (ignores `year`) |
+| `retention` | | Three years ending `year`: policy retention (renewed ÷ ended, excluding cancelled) and customer retention (covered last year and again this year) |
+| `commissions` | `group_by` = `insurer` \| `product` \| `sub_agent` \| `month` | Expected, received and pending commission, and the sub-agent share, by policy start year |
+| `sub-agent-production` | | Policies, premium, commission and renewal rate per sub-agent and the main agent |
+| `claims` | `group_by` = `insurer` \| `product` | Claims by date of loss; loss ratio = approved/paid ÷ premium of policies starting in the year |
+| `commission-list` | `month`, `status`, `commission_type` | One row per commission; used by the commissions page export |
+
+### Renewal calendar and filters
+
+`GET /renewals/calendar?month=YYYY-MM` returns every policy ending in the month (max 1000): `policy_id`, `policy_number`, `product_type`, `coverage_end`, `renewal_status`, `premium_amount`, `days_until_expiry`, `customer_name`, `insurer_name`, `workflow_stage`. `GET /renewals` and `GET /renewals/stats` also accept `insurer_id`, `product_type` and `sub_agent_id` (`main` = issued by the main agent); the calendar accepts the same three.
+
+### Notifications
+
+Rows are created when the feed is read (`helpers/notifications.php`); a unique `dedupe_key` per event makes that idempotent. Types: `expiring_today`, `expiring_week`, `policy_lapsed`, `premium_overdue`, `commission_received`, `claim_status`. Lapsed, commission and claim events are picked up for 14 days. Read state is per company.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/notifications?limit=&unread=1` | `{items[{notification_id,type,title,body,link,read_at,created_at}], unread_count}` |
+| POST | `/notifications/{id}/read` | Mark one read |
+| POST | `/notifications/read-all` | Mark all read |
+
+### Tasks
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/tasks?status=open\|done\|all&due=overdue\|today\|week\|today_overdue&customer_id=&policy_id=&claim_id=&limit=` | `{items[], overdue_count, today_count}`; each item has `days_until_due` (negative = overdue) and the linked `customer_name`, `policy_number`, `claim_number` |
+| POST | `/tasks` | `{title, due_date, notes?, customer_id?, policy_id?, claim_id?}`; links must belong to the company |
+| PUT / DELETE | `/tasks/{id}` | Update (same body) / delete |
+| POST | `/tasks/{id}/complete`, `/tasks/{id}/reopen` | Toggle `status` |
+
+**Tasks digest** (`php notification/tasks_digest.php [--dry-run]`, CLI only, run daily): sends open tasks due today or overdue to each company's `notification_settings.whatsapp_target_number`. Cron: `30 7 * * *`.
+
+
+## Bulk import (customers, policies)
+
+`POST /api/v1/customers/import` and `POST /api/v1/policies/import` — multipart `file` (CSV or XLSX, first sheet, ≤ 5 MB, ≤ 5000 rows); header names are case-insensitive. Add `dry_run=1` to validate without saving: the response has `total`, `valid_count`, `failed_count`, `failed` (every invalid row with its reason) and `preview` (first 200 rows with their `errors`). Without `dry_run`, valid rows are saved in one transaction and invalid ones skipped: `{inserted, failed_count, failed}`. Row numbers are spreadsheet rows (header = 1).
+
+`GET /api/v1/customers/import/template` and `GET /api/v1/policies/import/template` (`?format=xlsx|csv`) download a template with one example row.
+
+- **Customers:** required `customer_type`, `display_name`; individuals need a 16-digit `nik`; companies need `company_legal_name`, `npwp_company`, `pic_name`, `pic_phone`, `pic_whatsapp`. A NIK/NPWP already registered, or repeated in the file, is rejected.
+- **Policies:** required `policy_number`, `insurer`, `product_type`, `coverage_start`, `coverage_end`, `sum_insured`, `premium_amount`, plus `customer_identifier` (NIK/NPWP) or `customer_name` (exact, must be unique). `insurer` matches an active insurer's short name, agent code or name. `commission_rate`/`commission_tax_rate` default from the master product like `POST /policies`. Dates accept `YYYY-MM-DD`, `DD/MM/YYYY` or Excel dates.
+
+---
+
+## Plans, Limits & Subscription Payment (SumoPod)
+
+**Plans:** Starter (free forever), Profesional, Tim. A company's *effective* plan is the one it has paid for: a paid plan that is unpaid or past `next_billing_date` falls back to **Starter limits** (no lock-out). There is no trial — a paid plan chosen at register starts `payment_status = unpaid` until checkout completes.
+
+| Capability | Starter | Profesional | Tim |
+|---|---|---|---|
+| Active policies | 50 | unlimited | unlimited |
+| WhatsApp sending (manual, broadcast, renewal reminders, greetings) | – | ✔ | ✔ |
+| Excel export (policies, customers, reports `?format=xlsx`) | – | ✔ | ✔ |
+| Commission statements (full commission reconciliation) | – | ✔ | ✔ |
+| Sub-agents (multi-agent, commission split, team analytics) | – | – | ✔ |
+
+Refused calls return `403` with `error.code`:
+- `ERR_PLAN_005` — feature not in the plan (`details.required_plan`, `details.feature`)
+- `ERR_PLAN_006` — Starter policy cap reached (`POST /policies`, `POST /policies/import`)
+
+**Endpoints** (`/api/v1/subscription/...`)
+
+| Endpoint | Description |
+|---|---|
+| `GET /current` | Subscription plus `effective` (tier, `in_effect`, `policy_limit`, `features`), `pending_payment`, `usage.active_policy_count` |
+| `POST /checkout` `{service_id}` | Creates a pending QRIS payment; returns `payment_link_url`. `409 ERR_SUB_009` if one is already pending. Sub-agent logins are refused. |
+| `GET /payments/{payment_id}` | Payment status (`pending`/`completed`/`failed`/`expired`) |
+| `POST /webhook` | SumoPod → API, no JWT; Svix-signature verified, idempotent on `svix-id`, amount must match. `payment.completed` activates the plan for one billing cycle |
+| `PUT /change-plan` | Only to a free plan. Paid targets return `402 ERR_SUB_008` — use checkout |
+
+**Setup:** run `migration_subscription_payment.sql`; set `SUMOPOD_API_KEY`, `SUMOPOD_WEBHOOK_SECRET` (and optional `SUMOPOD_SUCCESS_URL` / `SUMOPOD_CANCEL_URL`) in `.env`; register `https://<host>/api/v1/subscription/webhook` in the SumoPod dashboard (Live and Sandbox have separate key/secret pairs).

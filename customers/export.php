@@ -13,7 +13,9 @@ function exportCustomers($conn, $company_id, array $params): void {
     $where = "company_id = '$company_id'";
 
     if ($search) {
-        $where .= " AND (display_name LIKE '%$search%' OR company_legal_name LIKE '%$search%' OR nik LIKE '%$search%' OR npwp_company LIKE '%$search%')";
+        // Escape LIKE wildcards — see policies/export.php for rationale.
+        $searchEsc = str_replace(['%', '_'], ['\%', '\_'], $search);
+        $where .= " AND (display_name LIKE '%$searchEsc%' ESCAPE '\\\\' OR company_legal_name LIKE '%$searchEsc%' ESCAPE '\\\\' OR nik LIKE '%$searchEsc%' ESCAPE '\\\\' OR npwp_company LIKE '%$searchEsc%' ESCAPE '\\\\')";
     }
     if ($customer_type && in_array($customer_type, ['individual', 'company'], true)) {
         $where .= " AND customer_type = '$customer_type'";
@@ -30,17 +32,19 @@ function exportCustomers($conn, $company_id, array $params): void {
             created_at
         FROM " . APP_SCHEMA . ".customers
         WHERE $where
-        ORDER BY created_at DESC";
+        ORDER BY created_at DESC
+        LIMIT 10000";
 
     $result = mysqli_query($conn, $sql);
     if (!$result) {
-        jsonResponse(500, 'Export query failed', ['error' => mysqli_error($conn)]);
+        error_log('exportCustomers DB error: ' . mysqli_error($conn));
+        jsonResponse(500, 'Internal server error');
         return;
     }
 
     $customers = mysqli_fetch_all($result, MYSQLI_ASSOC);
     if (empty($customers)) {
-        jsonResponse(404, 'No customers found for export');
+        jsonResponse(200, 'No customers found for export', ['data' => []]);
         return;
     }
 

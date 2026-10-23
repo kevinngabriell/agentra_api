@@ -1,11 +1,13 @@
 <?php
 require_once __DIR__ . '/../general.php';
 
+// Public endpoint — the plans catalog is viewable without authentication.
+
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     jsonResponse(405, 'Method not allowed');
 }
 
-$appId = cleanInput($_GET['app_id'] ?? '');
+$appId = mysqli_real_escape_string($conn, trim($_GET['app_id'] ?? ''));
 
 if (!$appId) {
     jsonResponse(400, 'app_id diperlukan');
@@ -17,12 +19,13 @@ $result = mysqli_query($conn, "SELECT service_id, service_name, service_descript
     ORDER BY service_price ASC");
 
 if (!$result) {
-    jsonResponse(500, 'Database error: ' . mysqli_error($conn));
+    error_log('plans/index DB error: ' . mysqli_error($conn));
+    jsonResponse(500, 'Internal server error');
 }
 
 $data = [];
 while ($svc = mysqli_fetch_assoc($result)) {
-    $sid      = cleanInput($svc['service_id']);
+    $sid      = mysqli_real_escape_string($conn, $svc['service_id']);
     $features = [];
 
     $fResult = mysqli_query($conn, "SELECT feature_text, sort_order

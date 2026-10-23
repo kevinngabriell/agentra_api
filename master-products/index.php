@@ -2,13 +2,20 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/product_types.php';
+require_once __DIR__ . '/../helpers/risk_details.php'; // RISK_FIELDS, used by productTypeCatalog()
+
+// --- PRODUCT TYPES (fixed list + per-type form options) ---
+function getProductTypes() {
+    jsonResponse(200, 'Product types found', ['data' => productTypeCatalog()]);
+}
 
 // --- GET ALL ---
 function getAllMasterProducts($conn, $company_id) {
     $company_id = mysqli_real_escape_string($conn, $company_id);
 
     $result = mysqli_query($conn,
-        "SELECT product_id, product_code, product_name, commission_rate,
+        "SELECT product_id, product_code, product_name, product_type, commission_rate,
                 default_tax_rate, policy_prefixes, is_active,
                 created_by, created_at, updated_by, updated_at
          FROM " . APP_SCHEMA . ".master_products
@@ -30,6 +37,12 @@ function createMasterProduct($conn, $input, $username, $company_id) {
             jsonResponse(400, "$field is required");
             return;
         }
+    }
+
+    $product_type = strtolower(trim((string)($input['product_type'] ?? '')));
+    if (!isValidProductType($product_type)) {
+        jsonResponse(400, 'product_type is required and must be one of: ' . implode(', ', array_keys(PRODUCT_TYPES)));
+        return;
     }
 
     $product_code    = strtolower(trim(mysqli_real_escape_string($conn, $input['product_code'])));
@@ -72,10 +85,10 @@ function createMasterProduct($conn, $input, $username, $company_id) {
     $now        = date('Y-m-d H:i:s');
 
     $sql = "INSERT INTO " . APP_SCHEMA . ".master_products
-                (product_id, company_id, product_code, product_name,
+                (product_id, company_id, product_code, product_name, product_type,
                  commission_rate, default_tax_rate, policy_prefixes, created_by, created_at)
             VALUES
-                ('$product_id', '$company_id', '$product_code', '$product_name',
+                ('$product_id', '$company_id', '$product_code', '$product_name', '$product_type',
                  $commission_rate, $default_tax_rate, $policy_prefixes_sql, '$username', '$now')";
 
     if (mysqli_query($conn, $sql)) {
@@ -91,7 +104,7 @@ function getMasterProductDetail($conn, $product_id, $company_id) {
     $company_id = mysqli_real_escape_string($conn, $company_id);
 
     $result = mysqli_query($conn,
-        "SELECT product_id, product_code, product_name, commission_rate,
+        "SELECT product_id, product_code, product_name, product_type, commission_rate,
                 default_tax_rate, policy_prefixes, is_active,
                 created_by, created_at, updated_by, updated_at
          FROM " . APP_SCHEMA . ".master_products
@@ -140,6 +153,15 @@ function updateMasterProduct($conn, $product_id, $input, $username, $company_id)
     if (isset($input['product_name'])) {
         $name = trim(mysqli_real_escape_string($conn, $input['product_name']));
         $updates[] = "product_name = '$name'";
+    }
+
+    if (isset($input['product_type'])) {
+        $type = strtolower(trim((string)$input['product_type']));
+        if (!isValidProductType($type)) {
+            jsonResponse(400, 'product_type must be one of: ' . implode(', ', array_keys(PRODUCT_TYPES)));
+            return;
+        }
+        $updates[] = "product_type = '$type'";
     }
 
     if (isset($input['commission_rate'])) {
@@ -228,6 +250,7 @@ try {
     if ($product_id) {
         switch ($method) {
             case 'GET':
+                if ($product_id === 'types') { getProductTypes(); break; }
                 getMasterProductDetail($conn, $product_id, $company_id);
                 break;
             case 'PUT':
@@ -254,6 +277,8 @@ try {
         }
     }
 
-} catch (Exception $e) {
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log($e->getMessage());
+    Response::internalError();
 }

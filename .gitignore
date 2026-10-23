@@ -4,3 +4,5 @@ vendor/
 .history
 *.sql
 agentra_[0-9]*
+!migrations/
+!migrations/**/*.sql

@@ -1,11 +1,14 @@
 <?php
 require_once __DIR__ . '/../general.php';
 
+// Require auth — the plan detail endpoint is not public.
+$authUser = requireAuth();
+
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     jsonResponse(405, 'Method not allowed');
 }
 
-$planId = cleanInput($action ?? '');
+$planId = mysqli_real_escape_string($conn, trim($action ?? ''));
 
 if (!$planId) {
     jsonResponse(400, 'Plan ID diperlukan');
@@ -21,7 +24,7 @@ if (!$result || mysqli_num_rows($result) === 0) {
 }
 
 $svc      = mysqli_fetch_assoc($result);
-$sid      = cleanInput($svc['service_id']);
+$sid      = mysqli_real_escape_string($conn, $svc['service_id']);
 $features = [];
 
 $fResult = mysqli_query($conn, "SELECT feature_text, sort_order

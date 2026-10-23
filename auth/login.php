@@ -4,27 +4,47 @@ require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 
 function login($conn, $input){
-    $email = cleanInput($input['email'] ?? '');
-    $password = trim($input['password'] ?? '');
+    $email    = trim($input['email']    ?? '');
+    $password = $input['password']      ?? '';
 
-    if (!$email || !$password) {
-        jsonResponse(422, 'Email and password are required');
+    if (!$email || $password === '') {
+        throw ApiException::from('ERR_AUTH_005');
     }
 
-    $result = mysqli_query($conn, "SELECT user_id, username, password, app_role_id, company_id FROM " . CORE_SCHEMA . ".app_user WHERE username = '$email' AND app_id = '7c2e6a2f-b254-4bbb-87f2-c6ece0f88db2' LIMIT 1");
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        throw ApiException::from('ERR_AUTH_006');
+    }
+
+    $emailEscaped = mysqli_real_escape_string($conn, $email);
+
+    $result = mysqli_query($conn, "SELECT user_id, username, password, app_role_id, company_id, account_status FROM " . CORE_SCHEMA . ".app_user WHERE username = '$emailEscaped' AND app_id = '" . AGENTRA_APP_ID . "' LIMIT 1");
 
     if (!$result) {
-        jsonResponse(500, 'Database error: ' . mysqli_error($conn));
+        error_log('login DB error: ' . mysqli_error($conn));
+        throw ApiException::from('ERR_COMMON_005');
     }
 
-    if (mysqli_num_rows($result) === 0) {
-        jsonResponse(401, 'Invalid credentials');
-    }
-
-    $user = mysqli_fetch_assoc($result);
+    $dummyHash = '$2y$10$abcdefghijklmnopqrstuvDEADBEEFDEADBEEFDEADBEEFDEADBEEF';
+    $user = ($result && mysqli_num_rows($result) > 0) ? mysqli_fetch_assoc($result) : ['password' => $dummyHash];
 
     if (!password_verify($password, $user['password'])) {
-        jsonResponse(401, 'Invalid credentials');
+        throw ApiException::from('ERR_AUTH_001');
+    }
+
+    if (!isset($user['user_id'])) {
+        throw ApiException::from('ERR_AUTH_001');
+    }
+
+    if (in_array($user['account_status'] ?? '', ['suspended', 'disabled', 'rejected'], true)) {
+        throw ApiException::from('ERR_AUTH_003');
+    }
+
+    if (password_needs_rehash($user['password'], PASSWORD_DEFAULT)) {
+        $newHash = password_hash($password, PASSWORD_DEFAULT);
+        if ($newHash !== false) {
+            $uid = mysqli_real_escape_string($conn, $user['user_id']);
+            mysqli_query($conn, "UPDATE " . CORE_SCHEMA . ".app_user SET password = '$newHash' WHERE user_id = '$uid'");
+        }
     }
 
     $claims = [
@@ -34,13 +54,14 @@ function login($conn, $input){
         'company_id' => $user['company_id'],
     ];
 
-    jsonResponse(200, 'Login successful', [
+    RequestLogger::setActor($claims);
+
+    Response::success([
         'access_token'  => JWT::encode($claims),
         'refresh_token' => JWT::encodeRefresh($claims),
         'token_type'    => 'Bearer',
         'expires_in'    => JWT::ACCESS_TTL,
-    ]);
-
+    ], null, 200, 'Login successful');
 }
 
 try {
@@ -49,14 +70,17 @@ try {
 
     switch($method){
         case 'POST':
-            $input = json_decode(file_get_contents('php://input'), true);
+            $input = input();
             login($conn, $input);
             break;
-        default : 
-            jsonResponse(405, 'Method not allowed');
-            break;
+        default :
+            Response::methodNotAllowed();
     }
 
-} catch (Exception $e){
-    jsonResponse(500, 'Internal Server Error', ['error' => $e->getMessage()]);
+} catch (ApiException $e) {
+    Response::error($e->errCode, $e->getMessage(), $e->httpStatus, $e->details);
+} catch (\Throwable $e) {
+    RequestLogger::setException($e);
+    error_log('login exception: ' . $e->getMessage());
+    Response::internalError();
 }
