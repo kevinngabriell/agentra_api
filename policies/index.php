@@ -616,13 +616,13 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         }
         $input['issuing_agent_id'] = $new_agent;
     }
-    if (isset($input['object_insured'])) {
-        $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
+    if (array_key_exists('object_insured', $input)) {
+        $val = trim(mysqli_real_escape_string($conn, (string)$input['object_insured']));
         $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
     }
     // [NEW v1.1] insured_name: optional "nama tertanggung" override, falls back to customer.display_name when NULL.
-    if (isset($input['insured_name'])) {
-        $val = trim(mysqli_real_escape_string($conn, $input['insured_name']));
+    if (array_key_exists('insured_name', $input)) {
+        $val = trim(mysqli_real_escape_string($conn, (string)$input['insured_name']));
         $updates[] = "insured_name = " . ($val !== '' ? "'$val'" : 'NULL');
     }
     if (isset($input['sum_insured'])) {
@@ -915,13 +915,13 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
             unset($input['policy_number']);
         }
     }
-    if (isset($input['object_insured'])) {
-        $val = trim(mysqli_real_escape_string($conn, $input['object_insured']));
+    if (array_key_exists('object_insured', $input)) {
+        $val = trim(mysqli_real_escape_string($conn, (string)$input['object_insured']));
         $updates[] = "object_insured = " . ($val !== '' ? "'$val'" : 'NULL');
     }
     // [NEW v1.1] insured_name: optional "nama tertanggung" override, falls back to customer.display_name when NULL.
-    if (isset($input['insured_name'])) {
-        $val = trim(mysqli_real_escape_string($conn, $input['insured_name']));
+    if (array_key_exists('insured_name', $input)) {
+        $val = trim(mysqli_real_escape_string($conn, (string)$input['insured_name']));
         $updates[] = "insured_name = " . ($val !== '' ? "'$val'" : 'NULL');
     }
     if (isset($input['sum_insured'])) {

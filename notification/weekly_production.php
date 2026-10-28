@@ -146,7 +146,7 @@ foreach ($companyIds as $company_id) {
     $profiles = [];
     $profRes = mysqli_query($conn, "SELECT ap.user_id, ap.whatsapp_number, u.first_name
         FROM " . APP_SCHEMA . ".agent_profiles ap
-        LEFT JOIN " . CORE_SCHEMA . ".app_user u ON u.user_id = ap.user_id
+        LEFT JOIN " . CORE_SCHEMA . ".app_user u ON u.user_id COLLATE utf8mb4_unicode_ci = ap.user_id COLLATE utf8mb4_unicode_ci
         WHERE ap.company_id = '$cid'");
     if ($profRes) {
         foreach (mysqli_fetch_all($profRes, MYSQLI_ASSOC) as $p) {
