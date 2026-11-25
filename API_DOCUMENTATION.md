@@ -3287,3 +3287,85 @@ Refused calls return `403` with `error.code`:
 | `PUT /change-plan` | Only to a free plan. Paid targets return `402 ERR_SUB_008` — use checkout |
 
 **Setup:** run `migration_subscription_payment.sql`; set `SUMOPOD_API_KEY`, `SUMOPOD_WEBHOOK_SECRET` (and optional `SUMOPOD_SUCCESS_URL` / `SUMOPOD_CANCEL_URL`) in `.env`; register `https://<host>/api/v1/subscription/webhook` in the SumoPod dashboard (Live and Sandbox have separate key/secret pairs).
+
+## Large Accounts (v2.1.0)
+
+Built from `docs/INSURANCE_GAP_AUDIT.md` in the web app repository. Schema: `migrations/v2.1.0/20261124_v2.1.0_large_accounts.sql` (additive, re-runnable). Validation errors use `ERR_V21_001`–`ERR_V21_020`.
+
+### Premium model (read this first)
+
+| Field | Meaning |
+|---|---|
+| `policies.premium_amount`, `sum_insured` | The **current annual contract** (unchanged meaning; coverage items still drive it) |
+| `policies.issued_premium_amount`, `issued_customer_premium` | The **original debit note**. Payments bill this amount. Set at create / renew / import |
+| `policy_endorsements` | One **debit or credit note** per premium-changing endorsement, with its own commission |
+
+- A change sent with `change_kind: "endorsement"` (PUT `/policies/{id}`, coverage add / edit / delete, vehicle add / edit / remove) moves the annual contract **and** writes a ledger row: `premium_delta` = annual difference × pro-rata (or short-period / flat) from `effective_date`. The policy's commission record stays on the original note; the note carries `commission_delta` (pending → received / clawed back).
+- A **correction** (`change_kind: "correction"`, PATCH `/policies/{id}`) moves the original debit note by the correction's own difference and re-syncs the pending commission to it. It never resets the note to the annual premium.
+- Billing options accepted next to `change_kind` on those requests: `calc_method` (`pro_rata` | `short_period` | `flat`), `endorsement_materai`, `endorsement_biaya_polis`, `due_date`, `skip_billing`.
+- Short-period scale (% of annual premium kept, part month = full month): 1→20, 2→30, 3→40, 4→50, 5→60, 6→70, 7→75, 8→80, 9→85, 10→90, 11→95, 12→100.
+- Note numbers: `DN-YYYY-NNNNN` / `CN-YYYY-NNNNN`, sequential per company (`document_sequences`). New policies get their DN number at creation; older ones on first billing read.
+
+### Endorsements & cancellation — `/policies/...`
+
+| Endpoint | Description |
+|---|---|
+| `GET /policies/endorsements?status=all\|open_debit\|open_credit\|commission_pending&insurer_id&month&policy_id` | Company-wide ledger + summary |
+| `GET /policies/{id}/endorsements` | The policy's notes, `summary` (issued / endorsement / billed premium, open debit / credit) and `cancellation` |
+| `POST /policies/{id}/endorsements` | Record a note the insurer issued: `endorsement_type`, `effective_date`, `calc_method` (`manual` takes `premium_delta`), `annual_premium_delta`, `sum_insured_delta`, `endorsement_materai`, `endorsement_biaya_polis`, `endorsement_number`, `description`, `due_date`, `apply_to_contract` |
+| `POST /policies/{id}/endorsements/preview` | Same body; returns `premium_delta`, `commission_delta`, `pro_rata_factor`, `remaining_days`, `short_period_percent` |
+| `PUT /policies/{id}/endorsements/{eid}` | `settled_date`, `settled_reference`, `commission_status`, `commission_settled_date`, `due_date`, `is_void`, … |
+| `POST /policies/{id}/cancel[/preview]` | `cancellation_date`, `reason` (`insured_request`\|`non_payment`\|`sold`\|`moved_insurer`\|`insurer_request`\|`other`), `method` (`short_period`\|`pro_rata`\|`full`\|`none`\|`manual` + `refund_amount`), `note`, `endorsement_number`. Writes a credit note for the refund (on billed premium = original + endorsements) with commission clawback, sets `renewal_status = cancelled`, and creates a notification task per bank / leasing party. `full` also cancels a pending policy commission. |
+| `PUT /policies/{id}/admin` | No-premium fields: `currency`, `exchange_rate`, `sum_insured_fc`, `premium_fc`, `covernote_number`, `covernote_date`, `covernote_expiry`, `policy_doc_received_date`, `renewal_lead_days` (also accepted on `POST /policies`) |
+| `POST /policies/{id}/debit-note` | Assigns / returns the original debit note number |
+
+A cancelled policy refuses further changes (`ERR_V21_014`). `GET /policies/{id}` now adds `qq_name`, `billing`, `coassurance_total`, `schedule_counts`, `insurer_assistance_phone`, `customer_whatsapp`, `customer_pic_whatsapp`. `GET /policies/{id}/payments` adds `debit_note_number`; `expected_amount` is the issued customer premium. `GET /policies/overdue-premiums` rows add `kind` (`policy`\|`endorsement`\|`year`), `note_number`, `reference_id`.
+
+### Schedules — `/policies/{id}/...`
+
+| Endpoint | Description |
+|---|---|
+| `GET\|POST /locations`, `PUT\|DELETE /locations/{lid}` | Property locations: address + lat/lng + `area_name`, occupation, construction, `eq_zone`, flood, materials, protections (`has_apar`…), `floor_area_m2` × `rebuild_cost_per_m2`, `stock_ownership`, `bailee_liability_covered`, `occupancy_status`, `pml_percent`. GET returns each location's items, TSI, premium, PML, rebuild value and `underinsured` (building SI < 90% of rebuild value). Delete is refused while items point at it (`ERR_V21_008`). Link items with `PUT /coverages/{cid}` `{location_id}` (data maintenance: no billing, no correction lock). |
+| `GET /locations/{lid}/nearby?radius_km=1` | Other in-force locations within the radius or in the same `area_name`, with total SI (accumulation) |
+| `GET\|POST /recommendations`, `PUT\|DELETE /recommendations/{rid}` | Survey recommendations / warranties: `description`, `location_id`, `priority`, `is_warranty`, `due_date`, `status` (`open`\|`done`\|`waived`) |
+| `GET\|POST /stock-declarations`, `PUT\|DELETE /stock-declarations/{did}`, `POST /stock-declarations/adjust` | Monthly stock declarations (`period_month`, `declared_value`, `location_id`) for policies whose risk details set `is_stock_declaration`. `calculation`: average × `stock_rate_permille` vs `stock_deposit_premium`; a refund is capped at `stock_refund_cap_percent` (default 50%). `adjust` writes the debit / credit note. |
+| `GET\|POST /vehicles`, `POST /vehicles/import {rows[]}`, `PUT\|DELETE /vehicles/{vid}` | Fleet schedule. Each vehicle is a coverage item of type `kendaraan` (`sum_insured`, `rate_percent` or `rate_permille`). Import (≤ 500 rows) is all-or-nothing. Duplicate plates are refused. Policy search matches fleet plates / chassis / engine numbers. |
+| `GET\|POST /parties`, `PUT\|DELETE /parties/{pid}` | Banks / leasing / loss payees: `party_type`, `name`, `branch`, `reference_number`, `tenor_end`, `on_insurer_panel`, `qq_in_name`, `notify_renewal`, `proof_sent_date` |
+| `GET /years`, `POST /years/generate {years, depreciation_percent}`, `PUT /years/{yid}`, `DELETE /years` | Multi-year schedule; year 1 is the original debit note, later years are billed through the overdue list |
+
+Renewal copies locations (items re-linked), vehicles, parties (proof date cleared, ended tenors dropped), the co-insurance panel and currency, and refuses a panel that does not total 100% (`ERR_V21_007`).
+
+### Claims
+
+New claim fields (create / update): `coverage_id`, `claim_type`, `value_at_risk`, `salvage_amount`, `currency`, `exchange_rate`, `estimated_loss_fc`, adjuster (`adjuster_firm`, `adjuster_name`, `adjuster_appointed_date`, `prelim_report_date`, `final_report_date`), motor (`workshop_name`, `spk_date`, `own_risk_paid_date`, `repair_status`, `vehicle_handover_date`, `bpkb_handover_date`), deadlines (`notice_deadline`, `docs_deadline`, `decision_due`, `payment_due`). Leaving `deductible` out of `POST /claims` takes it from the policy's deductible terms for that loss.
+
+Statuses add `partially_paid`, `appeal`, `withdrawn`; paid claims can be reopened. `decision_due` / `payment_due` default to 30 days after documents complete / approval.
+
+| Endpoint | Description |
+|---|---|
+| `GET /claims/deductible-preview?policy_id&coverage_id&estimated_loss` | Deductible the policy terms give, sum insured, whether the average applies |
+| `POST /claims/{id}/reserves` | `amount`, `source`, `reserve_date`, `note`; updates `estimated_loss` |
+| `POST /claims/{id}/payments`, `DELETE /claims/{id}/payments/{pid}` | Interim / final payments (`payer_name` matches co-insurers); total ≤ approved (`ERR_V21_016`); drives `partially_paid` / `paid` |
+| `POST /claims/{id}/recoveries`, `DELETE /claims/{id}/recoveries/{rid}` | Salvage / subrogation |
+
+`GET /claims/{id}` adds `reserves`, `payments`, `recoveries`, `settlement` (assessed loss → average → deductible → salvage → net, vs approved), `coinsurance_split`, `deadlines`, `product_group`. Checklists vary by cause (motor theft / total loss / third party; travel medical / baggage / delay / cancellation) and resolve the line from the master product type.
+
+### Quotes
+
+`POST|PUT /quotes` accept `items[]` (`coverage_type`, `label`, `sum_insured`, `count_in_tsi`), `currency`, `exchange_rate`; each option accepts `item_rates[]` (‰ per item), `placement_status` (`draft`\|`submitted`\|`quoted`\|`declined`\|`referred`\|`awaiting_ri`), `submitted_date`, `responded_date`, `decline_reason`, `info_supplied`, `share_percent`, `is_leader`, `terms[]` (same shape as policy terms). `PUT /quotes/{id}/options/{oid}/placement` moves one insurer's submission. `POST /quotes/{id}/accept {option_id, panel_option_ids[]}` accepts a co-insurance panel (shares must total 100%).
+
+### Customers, insurers, tariffs, reports
+
+| Endpoint | Description |
+|---|---|
+| `GET\|PUT /customers/{id}/compliance` | `risk_rating`, `is_pep`, `screening_status`, `screened_at`, `screening_lists`, `screening_note`; returns beneficial owners, `edd_required`, `edd_reasons`, `screening_stale` |
+| `POST /customers/{id}/beneficial-owners`, `PUT\|DELETE …/{oid}` | Beneficial owners (ownership total ≤ 100%) |
+| `GET\|POST /insurers/{id}/products` | Default commission per product line (`product_type` from `/master-products/types`). An active rate is used for new policies of that line at that insurer, ahead of the master product. `PUT /insurers/{id}` accepts `assistance_phone`. |
+| `GET\|POST /tariffs/occupations`, `PUT\|DELETE …/{id}`, `POST /tariffs/occupations/import {rows[]}` | Company occupation codes |
+| `GET\|POST /tariffs/bands`, `PUT\|DELETE …/{id}` | Tariff bands entered by the company (no figures ship with the app) |
+| `GET /tariffs/check?type=property\|earthquake\|motor…` | `verdict`: `within`\|`below`\|`above`\|`no_band` |
+| `GET /reports/accumulation?group_by=area\|city\|district\|eq_zone` | Insured value in force per area with PML |
+| `GET /reports/endorsements?year&month&insurer_id` | Endorsement / credit notes and their commission |
+| `GET /reports/statement?customer_id\|group_id` | Statement of account: original notes, endorsement notes, multi-year premiums |
+
+Notifications add `covernote_due`, `claim_deadline`, `endorsement_due`, `warranty_due`, `party_proof_due`, `year_premium_due`, and a per-policy `renewal_lead_days` reminder. The renewal workflow adds the `awaiting_ri` stage. Documents add the `covernote`, `survey_report` and `adjuster_report` types.

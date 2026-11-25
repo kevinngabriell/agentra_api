@@ -24,7 +24,7 @@ const RISK_MEMBER_ROLES_BY_GROUP = [
     'travel' => ['traveller'],
     'pa'     => ['insured', 'beneficiary'],
 ];
-const RISK_MAX_MEMBERS = 200;
+const RISK_MAX_MEMBERS = 500; // corporate / group travel rosters
 
 // column => [type, max length | null]. The column set per group is the whitelist for that group.
 const RISK_FIELDS = [
@@ -37,6 +37,8 @@ const RISK_FIELDS = [
         'ext_flood' => ['bool', null], 'ext_earthquake' => ['bool', null], 'ext_rsmdcc' => ['bool', null], 'ext_terrorism' => ['bool', null],
         'tpl_limit' => ['money', null], 'pa_driver_limit' => ['money', null], 'pa_passenger_limit' => ['money', null],
         'pa_passenger_seats' => ['seats', null],
+        // [v2.1.0] Pre-cover inspection of used vehicles.
+        'inspection_status' => ['enum:not_required,pending,done,waived', null], 'inspection_date' => ['date', null],
     ],
     'cargo' => [
         'conveyance_name' => ['text', 120], 'voyage_from' => ['text', 120], 'voyage_to' => ['text', 120],
@@ -45,17 +47,32 @@ const RISK_FIELDS = [
     ],
     'travel' => [
         'destinations' => ['text', 500], 'schengen_certificate_no' => ['code', 60],
+        // [v2.1.0] Plan structure and benefit limits (limits in benefit_currency, usually USD or EUR).
+        'travel_plan_type' => ['enum:single,annual', null], 'max_trip_days' => ['int:1:730', null],
+        'plan_tier' => ['text', 60], 'travel_area' => ['enum:asean,asia,worldwide_excl_us,worldwide', null],
+        'family_type' => ['enum:individual,family,group', null], 'benefit_currency' => ['currency', null],
+        'medical_limit' => ['decimal', null], 'evacuation_limit' => ['decimal', null], 'baggage_limit' => ['decimal', null],
+        'delay_limit' => ['decimal', null], 'cancellation_limit' => ['decimal', null], 'max_age' => ['int:1:120', null],
     ],
     'pa' => [],
     'fire' => [
         'occupation_code' => ['text', 40], 'occupation_description' => ['text', 200],
         'survey_status' => ['enum:not_required,pending,scheduled,done', null], 'survey_date' => ['date', null],
         'ext_flood' => ['bool', null], 'ext_earthquake' => ['bool', null], 'ext_rsmdcc' => ['bool', null], 'ext_terrorism' => ['bool', null],
+        // [v2.1.0] Business interruption values and the stock declaration (adjustable) settings.
+        'bi_gross_profit' => ['money', null], 'bi_indemnity_months' => ['int:1:36', null], 'bi_time_deductible_days' => ['int:0:365', null],
+        'is_stock_declaration' => ['bool', null], 'stock_max_sum_insured' => ['money', null],
+        'stock_rate_permille' => ['decimal', null], 'stock_deposit_premium' => ['money', null],
+        'stock_refund_cap_percent' => ['decimal', null],
     ],
 ];
 
-const RISK_BOOL_COLUMNS = ['ext_flood', 'ext_earthquake', 'ext_rsmdcc', 'ext_terrorism', 'is_open_cover'];
-const RISK_INT_COLUMNS  = ['vehicle_year', 'vehicle_value', 'tariff_region', 'tpl_limit', 'pa_driver_limit', 'pa_passenger_limit', 'pa_passenger_seats'];
+const RISK_BOOL_COLUMNS = ['ext_flood', 'ext_earthquake', 'ext_rsmdcc', 'ext_terrorism', 'is_open_cover', 'is_stock_declaration'];
+const RISK_INT_COLUMNS  = ['vehicle_year', 'vehicle_value', 'tariff_region', 'tpl_limit', 'pa_driver_limit', 'pa_passenger_limit', 'pa_passenger_seats',
+                           'max_trip_days', 'max_age', 'bi_gross_profit', 'bi_indemnity_months', 'bi_time_deductible_days',
+                           'stock_max_sum_insured', 'stock_deposit_premium'];
+const RISK_FLOAT_COLUMNS = ['medical_limit', 'evacuation_limit', 'baggage_limit', 'delay_limit', 'cancellation_limit',
+                            'stock_rate_permille', 'stock_refund_cap_percent'];
 
 /**
  * Risk group for a policy, or null when the product has no risk details. $master_type is the
@@ -115,7 +132,7 @@ function riskText(mixed $value, string $field, int $max): ?string {
 }
 
 /** Validates one detail value. Returns null for "not set", else a string or int ready for SQL. */
-function riskParseValue(string $type, ?int $max, mixed $value, string $field): string|int|null {
+function riskParseValue(string $type, ?int $max, mixed $value, string $field): string|int|float|null {
     if ($type === 'bool') return riskBool($value, $field);
     if ($value === null || $value === '') return null;
 
@@ -126,6 +143,24 @@ function riskParseValue(string $type, ?int $max, mixed $value, string $field): s
         $s = $allowed === ['A', 'B', 'C'] ? strtoupper($s) : strtolower($s);
         if (!in_array($s, $allowed, true)) throw ApiException::from('ERR_RISK_003', ['field' => $field]);
         return $s;
+    }
+
+    // [v2.1.0] int:min:max, decimal (non-negative, up to 2 decimals stored), currency (ISO code).
+    if (str_starts_with($type, 'int:')) {
+        [, $min, $max_v] = explode(':', $type);
+        if (!is_numeric($value) || floor((float)$value) != (float)$value || (int)$value < (int)$min || (int)$value > (int)$max_v) {
+            throw ApiException::from('ERR_RISK_003', ['field' => $field]);
+        }
+        return (int)$value;
+    }
+    if ($type === 'decimal') {
+        if (!is_numeric($value) || (float)$value < 0 || (float)$value > 99_999_999_999_999) throw ApiException::from('ERR_RISK_003', ['field' => $field]);
+        return (float)$value;
+    }
+    if ($type === 'currency') {
+        $c = is_string($value) ? strtoupper(trim($value)) : '';
+        if (!preg_match('/^[A-Z]{3}$/', $c)) throw ApiException::from('ERR_RISK_003', ['field' => $field]);
+        return $c;
     }
 
     switch ($type) {
@@ -204,7 +239,14 @@ function riskParseMembers(mixed $input, string $group): array {
             'relationship' => riskText($m['relationship'] ?? null, $at . 'relationship', 60),
             'benefit_death' => null, 'benefit_disability' => null, 'benefit_medical' => null,
             'share_percent' => null,
+            // [v2.1.0] Per-traveller certificate and trip dates (annual / group travel).
+            'certificate_number' => $role === 'traveller' ? riskParseValue('code', 60, $m['certificate_number'] ?? null, $at . 'certificate_number') : null,
+            'trip_start' => $role === 'traveller' ? riskParseValue('date', null, $m['trip_start'] ?? null, $at . 'trip_start') : null,
+            'trip_end'   => $role === 'traveller' ? riskParseValue('date', null, $m['trip_end'] ?? null, $at . 'trip_end') : null,
         ];
+        if ($row['trip_start'] !== null && $row['trip_end'] !== null && $row['trip_end'] < $row['trip_start']) {
+            throw ApiException::from('ERR_RISK_003', ['field' => $at . 'trip_end']);
+        }
 
         if ($role === 'beneficiary') {
             $share = $m['share_percent'] ?? null;
@@ -295,11 +337,12 @@ function riskReplaceMembers($conn, string $policy_id, string $company_id, array 
         $ok = mysqli_query($conn,
             "INSERT INTO " . APP_SCHEMA . ".policy_risk_members
                 (member_id, company_id, policy_id, member_role, full_name, id_number, birth_date, relationship,
-                 benefit_death, benefit_disability, benefit_medical, share_percent, sort_order, created_by)
+                 benefit_death, benefit_disability, benefit_medical, share_percent, certificate_number, trip_start, trip_end, sort_order, created_by)
              VALUES ('$member_id', '$cid', '$pid', " . riskSqlValue($conn, $m['member_role']) . ", " . riskSqlValue($conn, $m['full_name']) . ", "
                 . riskSqlValue($conn, $m['id_number']) . ", " . riskSqlValue($conn, $m['birth_date']) . ", " . riskSqlValue($conn, $m['relationship']) . ", "
                 . riskSqlValue($conn, $m['benefit_death']) . ", " . riskSqlValue($conn, $m['benefit_disability']) . ", " . riskSqlValue($conn, $m['benefit_medical']) . ", "
-                . riskSqlValue($conn, $m['share_percent']) . ", " . ($i + 1) . ", '$usr')"
+                . riskSqlValue($conn, $m['share_percent']) . ", " . riskSqlValue($conn, $m['certificate_number'] ?? null) . ", "
+                . riskSqlValue($conn, $m['trip_start'] ?? null) . ", " . riskSqlValue($conn, $m['trip_end'] ?? null) . ", " . ($i + 1) . ", '$usr')"
         );
         if (!$ok) return false;
     }
@@ -315,6 +358,9 @@ function riskShapeDetails(array $row, string $group): array {
     foreach (RISK_INT_COLUMNS as $c) {
         if (array_key_exists($c, $row) && $row[$c] !== null) $row[$c] = (int)$row[$c];
     }
+    foreach (RISK_FLOAT_COLUMNS as $c) {
+        if (array_key_exists($c, $row) && $row[$c] !== null) $row[$c] = (float)$row[$c];
+    }
     return $row;
 }
 
@@ -322,7 +368,7 @@ function riskFetchMembers($conn, string $policy_id): array {
     $pid = mysqli_real_escape_string($conn, $policy_id);
     $res = mysqli_query($conn,
         "SELECT member_id, member_role, full_name, id_number, birth_date, relationship,
-                benefit_death, benefit_disability, benefit_medical, share_percent, sort_order
+                benefit_death, benefit_disability, benefit_medical, share_percent, certificate_number, trip_start, trip_end, sort_order
          FROM " . APP_SCHEMA . ".policy_risk_members WHERE policy_id = '$pid'
          ORDER BY FIELD(member_role, 'traveller', 'insured', 'beneficiary'), sort_order");
     if (!$res) throw new RuntimeException('riskFetchMembers: ' . mysqli_error($conn));
@@ -342,6 +388,10 @@ function riskChangedFields(?array $old, array $new): array {
     foreach ($new as $column => $value) {
         $before = $old[$column] ?? null;
         if (in_array($column, RISK_BOOL_COLUMNS, true)) { $before = (int)$before; }
+        if (in_array($column, RISK_FLOAT_COLUMNS, true)) {
+            if (($before === null) !== ($value === null) || ($before !== null && abs((float)$before - (float)$value) > 0.00001)) $changed[] = $column;
+            continue;
+        }
         if ((string)($before ?? '') !== (string)($value ?? '')) $changed[] = $column;
     }
     return $changed;
@@ -359,6 +409,9 @@ function riskSearchCondition(string $escaped): string {
         "r.engine_number LIKE '%$escaped%'",
         "r.bl_awb_number LIKE '%$escaped%'",
         "EXISTS (SELECT 1 FROM " . APP_SCHEMA . ".policy_cargo_declarations d WHERE d.policy_id = p.policy_id AND d.bl_awb_number LIKE '%$escaped%')",
+        // [v2.1.0] Vehicles of a fleet schedule.
+        "EXISTS (SELECT 1 FROM " . APP_SCHEMA . ".policy_vehicles v WHERE v.policy_id = p.policy_id AND (v.chassis_number LIKE '%$escaped%' OR v.engine_number LIKE '%$escaped%'"
+            . ($plate !== '' ? " OR REPLACE(REPLACE(v.plate_number, ' ', ''), '-', '') LIKE '%$plate%'" : '') . "))",
     ];
     if ($plate !== '') {
         $conds[] = "REPLACE(REPLACE(r.plate_number, ' ', ''), '-', '') LIKE '%$plate%'";

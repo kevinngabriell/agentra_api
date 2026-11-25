@@ -15,6 +15,9 @@ const POLICY_IN_FORCE_SQL = "(p.coverage_start <= CURDATE() AND p.coverage_end >
 function crossSellFamily(string $code, string $name, ?string $master_type = null): ?string {
     $n = strtolower($name);
     if (str_contains($n, 'tanggung gugat') || str_contains($n, 'liability')) return 'liability';
+    // [v2.1.0] Lines without risk details are families of their own (classified products).
+    if (in_array($master_type, ['liability', 'engineering', 'marine_hull', 'bonds', 'health'], true)) return $master_type;
+    if (str_contains($n, 'machinery') || str_contains($n, 'kerusakan mesin') || str_contains($n, 'rekayasa') || str_contains($n, 'engineering')) return 'engineering';
     $group = riskGroup($code, '', $master_type);
     if ($group) return $group;
     foreach ([
@@ -40,6 +43,11 @@ const CROSS_SELL_RULES = [
     ['has' => 'cargo',  'missing' => 'liability', 'customer_type' => 'company',    'reason' => 'Memiliki asuransi cargo, tanggung gugat belum dilindungi'],
     ['has' => 'travel', 'missing' => 'pa',        'customer_type' => null,         'reason' => 'Memiliki asuransi perjalanan, belum memiliki perlindungan kecelakaan diri'],
     ['has' => 'liability', 'missing' => 'fire',   'customer_type' => 'company',    'reason' => 'Memiliki tanggung gugat, aset usaha belum diasuransikan kebakaran'],
+    // [v2.1.0] Warehouse, factory and fleet accounts.
+    ['has' => 'fire',   'missing' => 'engineering', 'customer_type' => 'company',  'reason' => 'Gudang / pabrik diasuransikan kebakaran, mesin belum dilindungi kerusakan mesin (Machinery Breakdown)'],
+    ['has' => 'motor',  'missing' => 'cargo',     'customer_type' => 'company',    'reason' => 'Memiliki armada kendaraan, barang yang diangkut belum diasuransikan (inland transit)'],
+    ['has' => 'motor',  'missing' => 'liability', 'customer_type' => 'company',    'reason' => 'Memiliki armada kendaraan, tanggung gugat usaha belum dilindungi'],
+    ['has' => 'engineering', 'missing' => 'fire', 'customer_type' => 'company',    'reason' => 'Mesin diasuransikan, bangunan / stok belum diasuransikan kebakaran'],
 ];
 
 /** Customer ids of the scope: the customer alone, or its whole group when scope = group. */

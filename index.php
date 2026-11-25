@@ -139,6 +139,11 @@ switch ($module) {
         require __DIR__ . '/claims/index.php';
         break;
 
+    // [v2.1.0] Occupation codes, tariff bands and rate checks.
+    case 'tariffs':
+        require __DIR__ . '/tariffs/index.php';
+        break;
+
     case 'comissions':
         require __DIR__ . '/comissions/index.php';
         break;

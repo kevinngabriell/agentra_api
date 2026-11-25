@@ -11,12 +11,35 @@ require_once __DIR__ . '/import.php';
 require_once __DIR__ . '/payments.php';
 require_once __DIR__ . '/risk_details.php';
 require_once __DIR__ . '/terms.php';
+// [v2.1.0] Large-account modules.
+require_once __DIR__ . '/endorsements.php';
+require_once __DIR__ . '/locations.php';
+require_once __DIR__ . '/vehicles.php';
+require_once __DIR__ . '/parties.php';
 require_once __DIR__ . '/../helpers/policy_change.php';
+require_once __DIR__ . '/../helpers/endorsements.php';
 
 // Looks up commission rate and tax rate from master_products.
 // Matches first by product_code (= product_type), then by policy number prefix via policy_prefixes.
 // [NEW v1.1] Returns ['rate' => float, 'tax_rate' => float, 'product_name' => string] or null if no match.
-function resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number) {
+function resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number, $insurer_id = null) {
+    // [v2.1.0] The insurer's default rate for the product's line (Settings → Asuransi → Produk) wins when set.
+    if ($insurer_id) {
+        require_once __DIR__ . '/../helpers/db.php';
+        require_once __DIR__ . '/../helpers/product_types.php';
+        $line = productTypeOf($conn, (string)$company_id, (string)$product_type);
+        if ($line !== null) {
+            $ins = dbOne($conn, "SELECT r.rate_percent, mp.default_tax_rate, mp.product_name
+                FROM {app}.insurer_commission_rates r
+                JOIN {app}.insurers i ON i.insurer_id = r.insurer_id AND i.company_id = ?
+                LEFT JOIN {app}.master_products mp ON mp.company_id = i.company_id AND mp.product_code = ?
+                WHERE r.insurer_id = ? AND r.product_type = ? AND r.is_active = 1 LIMIT 1",
+                [(string)$company_id, strtolower(trim((string)$product_type)), (string)$insurer_id, $line]);
+            if ($ins) {
+                return ['rate' => (float)$ins['rate_percent'], 'tax_rate' => (float)($ins['default_tax_rate'] ?? 0), 'product_name' => $ins['product_name'] ?? $line];
+            }
+        }
+    }
     $company_id   = mysqli_real_escape_string($conn, $company_id);
     $product_code = strtolower(trim(mysqli_real_escape_string($conn, $product_type)));
 
@@ -194,6 +217,9 @@ function createPolicy($conn, $input, $username, $company_id){
         $risk = riskParseInput($input, (string)($input['product_type'] ?? ''), (string)($input['policy_number'] ?? ''), productTypeOf($conn, $company_id, (string)($input['product_type'] ?? '')));
     }
 
+    // [v2.1.0] Currency, covernote, renewal lead time: validated now, stored after the insert.
+    $extras = policyExtrasParse($input);
+
     // With a coverage breakdown, sum_insured and premium_amount are derived from it, so they are not required.
     $required = ['insurer_id', 'customer_id', 'policy_number', 'product_type', 'coverage_start', 'coverage_end'];
     if (!$has_coverages) {
@@ -257,7 +283,7 @@ function createPolicy($conn, $input, $username, $company_id){
     }
 
     // Always resolve master product to get both commission rate and default tax rate.
-    $resolved = resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number);
+    $resolved = resolveCommissionRateFromDB($conn, $company_id, $product_type, $policy_number, $input['insurer_id'] ?? null);
 
     if (isset($input['commission_rate']) && $input['commission_rate'] !== '') {
         $commission_rate = round((float)$input['commission_rate'], 2);
@@ -471,6 +497,10 @@ function createPolicy($conn, $input, $username, $company_id){
                 return;
             }
         }
+        if ($extras) dbUpdate($conn, 'policies', $extras, ['policy_id' => $policy_id]);
+        // [v2.1.0] Freeze the original debit note; endorsements are billed on their own notes.
+        snapshotIssuedPremium($conn, $policy_id);
+        ensurePolicyDebitNote($conn, $company_id, $policy_id);
         insertPolicyLog($conn, $policy_id, $company_id, 'policy_created', 'Polis dibuat', $username);
         mysqli_commit($conn);
         jsonResponse(201, 'Policy created successfully', ['policy_id' => $policy_id]);
@@ -499,7 +529,8 @@ function getDetailPolicy($conn, $policy_id, $company_id){
 
     $result = mysqli_query($conn, "SELECT p.*,
         c.display_name AS customer_name, c.customer_type,
-        i.name AS insurer_name, i.short_name AS insurer_short_name
+        i.name AS insurer_name, i.short_name AS insurer_short_name, i.assistance_phone AS insurer_assistance_phone,
+        c.personal_whatsapp AS customer_whatsapp, c.pic_whatsapp AS customer_pic_whatsapp
         FROM " . APP_SCHEMA . ".policies p
         LEFT JOIN " . APP_SCHEMA . ".customers c ON c.customer_id = p.customer_id
         LEFT JOIN " . APP_SCHEMA . ".insurers  i ON i.insurer_id  = p.insurer_id
@@ -511,7 +542,55 @@ function getDetailPolicy($conn, $policy_id, $company_id){
         return;
     }
 
-    jsonResponse(200, 'Policy found', mysqli_fetch_assoc($result));
+    $row = mysqli_fetch_assoc($result);
+    // [v2.1.0] Name as printed with banks / leasing ("Bank X QQ PT ABC") and the billing ledger summary.
+    require_once __DIR__ . '/../helpers/schedules.php';
+    $row['qq_name'] = policyQqName($conn, $row['policy_id'], $row['insured_name'] ?: $row['customer_name']);
+    $row['billing'] = endPolicySummary($conn, $row);
+    $row['coassurance_total'] = coassuranceTotal($conn, $row['policy_id']);
+    $row['schedule_counts'] = dbOne($conn, "SELECT
+            (SELECT COUNT(*) FROM {app}.policy_locations WHERE policy_id = ?) AS locations,
+            (SELECT COUNT(*) FROM {app}.policy_vehicles WHERE policy_id = ?) AS vehicles,
+            (SELECT COUNT(*) FROM {app}.policy_parties WHERE policy_id = ?) AS parties,
+            (SELECT COUNT(*) FROM {app}.policy_year_schedule WHERE policy_id = ?) AS years,
+            (SELECT COUNT(*) FROM {app}.policy_risk_recommendations WHERE policy_id = ? AND status = 'open') AS open_recommendations",
+        array_fill(0, 5, $row['policy_id']));
+    foreach ($row['schedule_counts'] as $k => $v) $row['schedule_counts'][$k] = (int)$v;
+    jsonResponse(200, 'Policy found', $row);
+}
+
+/**
+ * [v2.1.0] Policy fields that change no premium: currency and its originals, covernote, policy document
+ * received, renewal lead time. Returns only the keys present in the request.
+ */
+function policyExtrasParse(array $input): array {
+    $set = inCurrency($input);
+    $set += inPresent($input, [
+        'sum_insured_fc' => fn($i) => inNumber($i, 'sum_insured_fc', 0, 99_999_999_999_999),
+        'premium_fc' => fn($i) => inNumber($i, 'premium_fc', 0, 99_999_999_999_999),
+        'covernote_number' => fn($i) => inText($i, 'covernote_number', 60),
+        'covernote_date' => fn($i) => inDate($i, 'covernote_date'),
+        'covernote_expiry' => fn($i) => inDate($i, 'covernote_expiry'),
+        'policy_doc_received_date' => fn($i) => inDate($i, 'policy_doc_received_date'),
+        'renewal_lead_days' => fn($i) => inInt($i, 'renewal_lead_days', 1, 365),
+    ]);
+    if (($set['currency'] ?? null) === 'IDR') { $set['sum_insured_fc'] = null; $set['premium_fc'] = null; }
+    return $set;
+}
+
+// PUT /policies/{id}/admin — covernote, policy document, renewal lead time, currency. No premium moves.
+function updatePolicyAdmin($conn, $policy_id, $company_id, array $input, string $username): void {
+    if (!dbOne($conn, "SELECT 1 FROM {app}.policies WHERE policy_id = ? AND company_id = ?", [$policy_id, $company_id])) throw ApiException::from('ERR_POLICY_001');
+    $set = policyExtrasParse($input);
+    if (!$set) throw ApiException::from('ERR_V21_002', ['field' => 'data']);
+    dbUpdate($conn, 'policies', $set + ['updated_by' => $username], ['policy_id' => $policy_id, 'company_id' => $company_id]);
+    $labels = ['currency' => 'mata uang', 'exchange_rate' => 'kurs', 'sum_insured_fc' => 'TSI valas', 'premium_fc' => 'premi valas',
+        'covernote_number' => 'nomor covernote', 'covernote_date' => 'tanggal covernote', 'covernote_expiry' => 'masa berlaku covernote',
+        'policy_doc_received_date' => 'polis diterima', 'renewal_lead_days' => 'jarak pengingat perpanjangan'];
+    insertPolicyLog($conn, $policy_id, $company_id, 'policy_updated',
+        'Data administrasi polis diperbarui: ' . implode(', ', array_map(fn($k) => $labels[$k] ?? $k, array_keys($set))), $username,
+        null, null, null, null, ['after' => $set]);
+    getDetailPolicy($conn, $policy_id, $company_id);
 }
 
 // --- DELETE (PO-004) ---
@@ -576,17 +655,21 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
         "SELECT issuing_agent_id, policy_number, premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
                 object_insured, insured_name, sum_insured, coverage_notes, construction_class,
                 risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
-                coverage_start, coverage_end, notes
+                coverage_start, coverage_end, notes, issued_premium_amount, renewal_status
          FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$policy_id' AND company_id = '$company_id' LIMIT 1");
     if (mysqli_num_rows($check) === 0) {
         jsonResponse(404, 'Policy not found');
         return;
     }
     $current = mysqli_fetch_assoc($check);
+    if ($current['renewal_status'] === 'cancelled') throw ApiException::from('ERR_V21_014');
 
     // PUT is the endorsement path: the insurer's endorsement number and effective date go in the log.
     $change = policyChangeParse($input);
     $change['kind'] = 'endorsement';
+    // [v2.1.0] The premium difference is billed through its own debit / credit note (helpers/endorsements.php).
+    $billing = endBillingParse($input);
+    $contract_before = ['sum_insured' => (int)$current['sum_insured'], 'premium' => (int)$current['premium_amount']];
 
     // With coverage items, sum_insured and premium_amount are derived from them (change the items instead).
     $cov_count = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS n FROM " . APP_SCHEMA . ".policy_coverages WHERE policy_id = '$policy_id'"))['n'];
@@ -827,15 +910,20 @@ function updatePolicy($conn, $policy_id, $input, $username, $company_id){
             reassignCommissionSubAgent($conn, $company_id, $policy_id, $input['issuing_agent_id']);
         }
 
-        if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
-            $final_premium  = $new_premium  ?? (int)$current['premium_amount'];
+        // [v2.1.0] The policy's commission record stays on the original debit note. A new rate or tax rate
+        // still applies to it; the premium difference earns its commission on the endorsement note below.
+        if ($new_rate !== null || $new_tax_rate !== null) {
+            $issued_premium = (int)($current['issued_premium_amount'] ?? $current['premium_amount']);
             $final_rate     = $new_rate     ?? (float)$current['commission_rate'];
             $final_tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
-            $final_amount   = (int)round($final_premium * $final_rate / 100);
-            syncCommission($conn, $policy_id, $final_premium, $final_rate, $final_amount, $final_tax_rate);
+            syncCommission($conn, $policy_id, $issued_premium, $final_rate, (int)round($issued_premium * $final_rate / 100), $final_tax_rate);
         }
 
-        jsonResponse(200, 'Policy updated successfully');
+        $ledger = endFromContractChange($conn, $company_id, $policy_id, $change, $billing, $contract_before,
+            policyContractTotals($conn, $policy_id), 'sum_insured_change',
+            $desc, 'policy_update', $username, 'policies', $policy_id);
+
+        jsonResponse(200, 'Policy updated successfully', ['endorsement' => $ledger]);
     } else {
         jsonResponse(500, 'Failed to update policy', ['error' => mysqli_error($conn)]);
     }
@@ -851,7 +939,7 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
     $policy_id = mysqli_real_escape_string($conn, $policy_id);
 
     $check = mysqli_query($conn,
-        "SELECT customer_id, policy_number, premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
+        "SELECT customer_id, policy_number, premium_amount, customer_premium_amount, commission_rate, commission_tax_rate, materai_amount, biaya_polis, diskon,
                 object_insured, insured_name, sum_insured, coverage_notes, construction_class,
                 risk_address, risk_village, risk_district, risk_city, risk_province, risk_postal_code, risk_latitude, risk_longitude,
                 coverage_start, coverage_end, notes
@@ -1116,12 +1204,14 @@ function directUpdatePolicy($conn, $policy_id, $input, $username, $company_id) {
         policyChangeLog($conn, $policy_id, $company_id, $change,
             !empty($changed_labels) ? implode(', ', $changed_labels) : 'polis diperbarui', $username, null, null, $log_meta);
 
+        // [v2.1.0] A correction fixes the original entry: the original debit note moves by the correction's own
+        // difference (endorsement notes stay as billed), and the pending commission follows the original note.
+        correctionShiftIssued($conn, $policy_id, (int)$current['premium_amount'], (int)$current['customer_premium_amount']);
         if ($new_premium !== null || $new_rate !== null || $new_materai !== null || $new_tax_rate !== null) {
-            $final_premium  = $new_premium  ?? (int)$current['premium_amount'];
+            $issued         = (int)dbValue($conn, "SELECT issued_premium_amount FROM {app}.policies WHERE policy_id = ?", [$policy_id]);
             $final_rate     = $new_rate     ?? (float)$current['commission_rate'];
             $final_tax_rate = $new_tax_rate ?? (float)$current['commission_tax_rate'];
-            $final_amount   = (int)round($final_premium * $final_rate / 100);
-            syncCommission($conn, $policy_id, $final_premium, $final_rate, $final_amount, $final_tax_rate);
+            syncCommission($conn, $policy_id, $issued, $final_rate, (int)round($issued * $final_rate / 100), $final_tax_rate);
         }
 
         jsonResponse(200, 'Policy updated successfully');
@@ -1419,7 +1509,7 @@ if (!$company_id) {
 
 // $action     = $parts[3] — policy_id, 'payment-summary', 'export', or ''
 // $sub_action = $parts[4] — 'renewal-status', 'follow-ups', 'payment-status', 'coverages', etc.
-$policy_id  = (!empty($action) && !in_array($action, ['payment-summary', 'export', 'import', 'overdue-premiums'], true)) ? $action : null;
+$policy_id  = (!empty($action) && !in_array($action, ['payment-summary', 'export', 'import', 'overdue-premiums', 'endorsements'], true)) ? $action : null;
 $sub_action = $parts[4] ?? '';
 
 try {
@@ -1429,6 +1519,11 @@ try {
     if ($action === 'payment-summary') {
         if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
         getPaymentSummary($conn, $company_id, $_GET);
+
+    // [v2.1.0] GET /api/v1/policies/endorsements — company-wide endorsement / credit note ledger
+    } elseif ($action === 'endorsements') {
+        if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
+        listCompanyEndorsements($conn, $company_id, $_GET);
 
     // GET /api/v1/policies/overdue-premiums
     } elseif ($action === 'overdue-premiums') {
@@ -1528,6 +1623,79 @@ try {
             case 'commission':
                 if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
                 getCommission($conn, $policy_id, $company_id);
+                break;
+            // ── [v2.1.0] Large-account modules ────────────────────────────────────
+            case 'endorsements':
+                $eid = $parts[5] ?? '';
+                if ($eid === '' && $method === 'GET') listPolicyEndorsements($conn, $company_id, $policy_id);
+                elseif ($eid === '' && $method === 'POST') addEndorsement($conn, $company_id, $policy_id, $input, $username);
+                elseif ($eid === 'preview' && $method === 'POST') previewEndorsement($conn, $company_id, $policy_id, $input);
+                elseif ($eid !== '' && $method === 'PUT') updateEndorsement($conn, $company_id, $policy_id, $eid, $input, $username);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'cancel':
+                if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+                if (($parts[5] ?? '') === 'preview') previewCancellation($conn, $company_id, $policy_id, $input);
+                else cancelPolicy($conn, $company_id, $policy_id, $input, $username);
+                break;
+            case 'locations':
+                $lid = $parts[5] ?? '';
+                if ($lid === '' && $method === 'GET') listLocations($conn, $company_id, $policy_id);
+                elseif ($lid === '' && $method === 'POST') saveLocation($conn, $company_id, $policy_id, null, $input, $username);
+                elseif ($lid !== '' && ($parts[6] ?? '') === 'nearby' && $method === 'GET') nearbyLocations($conn, $company_id, $policy_id, $lid, $_GET);
+                elseif ($lid !== '' && $method === 'PUT') saveLocation($conn, $company_id, $policy_id, $lid, $input, $username);
+                elseif ($lid !== '' && $method === 'DELETE') deleteLocation($conn, $company_id, $policy_id, $lid, $username);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'recommendations':
+                $rid = $parts[5] ?? '';
+                if ($rid === '' && $method === 'GET') listRecommendations($conn, $company_id, $policy_id);
+                elseif ($rid === '' && $method === 'POST') saveRecommendation($conn, $company_id, $policy_id, null, $input, $username);
+                elseif ($rid !== '' && $method === 'PUT') saveRecommendation($conn, $company_id, $policy_id, $rid, $input, $username);
+                elseif ($rid !== '' && $method === 'DELETE') deleteRecommendation($conn, $company_id, $policy_id, $rid);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'stock-declarations':
+                $did = $parts[5] ?? '';
+                if ($did === '' && $method === 'GET') listStockDeclarations($conn, $company_id, $policy_id);
+                elseif ($did === '' && $method === 'POST') saveStockDeclaration($conn, $company_id, $policy_id, null, $input, $username);
+                elseif ($did === 'adjust' && $method === 'POST') adjustStockDeclarations($conn, $company_id, $policy_id, $input, $username);
+                elseif ($did !== '' && $method === 'PUT') saveStockDeclaration($conn, $company_id, $policy_id, $did, $input, $username);
+                elseif ($did !== '' && $method === 'DELETE') deleteStockDeclaration($conn, $company_id, $policy_id, $did);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'vehicles':
+                $vid = $parts[5] ?? '';
+                if ($vid === '' && $method === 'GET') listVehicles($conn, $company_id, $policy_id);
+                elseif ($vid === '' && $method === 'POST') addVehicle($conn, $company_id, $policy_id, $input, $username);
+                elseif ($vid === 'import' && $method === 'POST') importVehicles($conn, $company_id, $policy_id, $input, $username);
+                elseif ($vid !== '' && $method === 'PUT') updateVehicle($conn, $company_id, $policy_id, $vid, $input, $username);
+                elseif ($vid !== '' && $method === 'DELETE') deleteVehicle($conn, $company_id, $policy_id, $vid, $input, $username);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'parties':
+                $pid2 = $parts[5] ?? '';
+                if ($pid2 === '' && $method === 'GET') listParties($conn, $company_id, $policy_id);
+                elseif ($pid2 === '' && $method === 'POST') saveParty($conn, $company_id, $policy_id, null, $input, $username);
+                elseif ($pid2 !== '' && $method === 'PUT') saveParty($conn, $company_id, $policy_id, $pid2, $input, $username);
+                elseif ($pid2 !== '' && $method === 'DELETE') deleteParty($conn, $company_id, $policy_id, $pid2, $username);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'years':
+                $yid = $parts[5] ?? '';
+                if ($yid === '' && $method === 'GET') listYears($conn, $company_id, $policy_id);
+                elseif ($yid === '' && $method === 'DELETE') clearYears($conn, $company_id, $policy_id, $username);
+                elseif ($yid === 'generate' && $method === 'POST') generateYears($conn, $company_id, $policy_id, $input, $username);
+                elseif ($yid !== '' && $method === 'PUT') updateYear($conn, $company_id, $policy_id, $yid, $input, $username);
+                else jsonResponse(405, 'Method Not Allowed');
+                break;
+            case 'admin':
+                if ($method !== 'PUT') { jsonResponse(405, 'Method Not Allowed'); }
+                updatePolicyAdmin($conn, $policy_id, $company_id, $input, $username);
+                break;
+            case 'debit-note':
+                if ($method !== 'POST') { jsonResponse(405, 'Method Not Allowed'); }
+                jsonResponse(200, 'Debit note number', ['debit_note_number' => ensurePolicyDebitNote($conn, $company_id, $policy_id)]);
                 break;
             // [NEW v1.1] Co-assurance participants for this policy.
             case 'coassurance':

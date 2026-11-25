@@ -12,7 +12,12 @@
 //   sub-agent-production   production per sub-agent (and the main agent)
 //   claims                 claims and loss ratio; group_by = insurer | product
 //   commission-list        every commission row, for the commissions page export
+//   [v2.1.0]
+//   accumulation           insured value in force per area / city / earthquake zone (group_by), with PML
+//   endorsements           endorsement debit / credit notes and their commission (month or year)
+//   statement              statement of account for a customer (customer_id) or customer group (group_id)
 
+require_once __DIR__ . '/../helpers/claims.php';
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/xlsx_writer.php';
@@ -313,10 +318,10 @@ function reportClaims($conn, string $cid, array $q, int $year): array {
 
     $claims = [];
     foreach (reportRows($conn, "SELECT $col AS grp, COUNT(*) AS claims,
-            SUM(cl.status IN ('reported', 'survey', 'documents_complete')) AS open_claims,
+            SUM(cl.status IN ('reported', 'survey', 'documents_complete', 'appeal')) AS open_claims,
             SUM(cl.status = 'rejected') AS rejected,
             COALESCE(SUM(cl.estimated_loss), 0) AS estimated,
-            COALESCE(SUM(CASE WHEN cl.status IN ('approved', 'paid') THEN COALESCE(cl.settlement_amount, cl.approved_amount) END), 0) AS incurred
+            COALESCE(SUM(" . claimIncurredSql('cl') . "), 0) AS incurred
         FROM " . APP_SCHEMA . ".claims cl
         JOIN " . APP_SCHEMA . ".policies p ON p.policy_id = cl.policy_id
         JOIN " . APP_SCHEMA . ".insurers i ON i.insurer_id = p.insurer_id
@@ -409,6 +414,154 @@ function reportCommissionList($conn, string $cid, array $q): array {
     ];
 }
 
+// ── [v2.1.0] Accumulation, endorsement ledger, statement of account ───────────
+
+function reportAccumulation($conn, string $cid, array $q): array {
+    require_once __DIR__ . '/../helpers/db.php';
+    require_once __DIR__ . '/../policies/locations.php';
+    $by = in_array($q['group_by'] ?? '', ['city', 'eq_zone', 'district'], true) ? $q['group_by'] : 'area';
+    $head = ['area' => 'Kawasan / Area', 'city' => 'Kota / Kabupaten', 'eq_zone' => 'Zona Gempa', 'district' => 'Kecamatan'][$by];
+    $groups = [];
+    foreach (accumulationPoints($conn, $cid) as $pt) {
+        $key = match ($by) {
+            'area' => $pt['area_name'] ?: ($pt['city'] ? $pt['city'] . ' (tanpa nama kawasan)' : 'Tanpa lokasi'),
+            'city' => $pt['city'] ?: 'Tanpa kota',
+            'district' => trim(($pt['district'] ?: '-') . ', ' . ($pt['city'] ?: '-')),
+            'eq_zone' => $pt['eq_zone'] ? 'Zona ' . $pt['eq_zone'] : 'Zona belum diisi',
+        };
+        $g = &$groups[$key];
+        $g ??= ['grp' => $key, 'locations' => 0, 'policies' => [], 'customers' => [], 'sum_insured' => 0, 'pml' => 0, 'largest' => 0];
+        $si = (int)$pt['sum_insured'];
+        $g['locations']++;
+        $g['policies'][$pt['policy_id']] = true;
+        $g['customers'][$pt['customer_name']] = true;
+        $g['sum_insured'] += $si;
+        $g['pml'] += $pt['pml_percent'] !== null ? (int)round($si * (float)$pt['pml_percent'] / 100) : $si;
+        $g['largest'] = max($g['largest'], $si);
+        unset($g);
+    }
+    $total = array_sum(array_column($groups, 'sum_insured'));
+    $rows = array_map(fn($g) => ['grp' => $g['grp'], 'locations' => $g['locations'], 'policies' => count($g['policies']),
+        'customers' => count($g['customers']), 'sum_insured' => $g['sum_insured'], 'pml' => $g['pml'], 'largest' => $g['largest'],
+        'share_pct' => reportPct($g['sum_insured'], $total)], array_values($groups));
+    usort($rows, fn($a, $b) => $b['sum_insured'] <=> $a['sum_insured']);
+    return [
+        'title'   => "Akumulasi Nilai Pertanggungan per $head — " . date('d/m/Y'),
+        'columns' => [
+            ['key' => 'grp', 'label' => $head, 'type' => 'text'],
+            ['key' => 'locations', 'label' => 'Lokasi', 'type' => 'int'],
+            ['key' => 'policies', 'label' => 'Polis', 'type' => 'int'],
+            ['key' => 'customers', 'label' => 'Customer', 'type' => 'int'],
+            ['key' => 'sum_insured', 'label' => 'Total Nilai Pertanggungan', 'type' => 'money'],
+            ['key' => 'pml', 'label' => 'PML (atau TSI bila PML kosong)', 'type' => 'money'],
+            ['key' => 'largest', 'label' => 'Lokasi Terbesar', 'type' => 'money'],
+            ['key' => 'share_pct', 'label' => '% dari Total', 'type' => 'pct'],
+        ],
+        'rows' => $rows, 'totals' => reportTotals($rows, ['locations', 'policies', 'customers', 'sum_insured', 'pml']),
+    ];
+}
+
+function reportEndorsements($conn, string $cid, array $q, int $year): array {
+    $where = "e.company_id = '$cid' AND e.is_void = 0" . reportInsurerFilter($conn, $q, 'p.insurer_id');
+    $period = (string)$year;
+    if (!empty($q['month']) && preg_match('/^\d{4}-\d{2}$/', $q['month'])) {
+        $where .= " AND DATE_FORMAT(e.effective_date, '%Y-%m') = '" . $q['month'] . "'";
+        $period = $q['month'];
+    } else {
+        $where .= " AND YEAR(e.effective_date) = $year";
+    }
+    $types = ['sum_insured_change' => 'Perubahan nilai', 'add_item' => 'Tambah item', 'remove_item' => 'Hapus item', 'extension' => 'Perluasan',
+              'insured_change' => 'Ganti tertanggung', 'period_change' => 'Perubahan periode', 'cancellation' => 'Pembatalan',
+              'stock_adjustment' => 'Penyesuaian stok', 'other' => 'Lainnya'];
+    $rows = reportRows($conn, "SELECT e.note_number, e.note_type, e.endorsement_number, e.endorsement_type, e.effective_date,
+            p.policy_number, c.display_name AS customer, i.short_name AS insurer,
+            e.premium_delta AS premium, (e.materai_amount + e.biaya_polis) AS fees, e.commission_delta AS commission,
+            e.due_date, e.settled_date, e.commission_status
+        FROM " . APP_SCHEMA . ".policy_endorsements e
+        JOIN " . APP_SCHEMA . ".policies p ON p.policy_id = e.policy_id
+        LEFT JOIN " . APP_SCHEMA . ".customers c ON c.customer_id = p.customer_id
+        LEFT JOIN " . APP_SCHEMA . ".insurers i ON i.insurer_id = p.insurer_id
+        WHERE $where ORDER BY e.effective_date, e.created_at LIMIT 5000");
+    foreach ($rows as &$r) {
+        foreach (['premium', 'fees', 'commission'] as $k) $r[$k] = (int)$r[$k];
+        $r['type'] = $types[$r['endorsement_type']] ?? $r['endorsement_type'];
+        $r['note'] = $r['note_number'] ?? '-';
+        $r['settled'] = $r['settled_date'] ? 'Lunas ' . $r['settled_date'] : ($r['note_type'] === 'none' ? '-' : 'Belum');
+    }
+    unset($r);
+    return [
+        'title'   => "Endorsemen & Nota Debit/Kredit — $period",
+        'columns' => [
+            ['key' => 'note', 'label' => 'No. Nota', 'type' => 'text'],
+            ['key' => 'effective_date', 'label' => 'Berlaku', 'type' => 'date'],
+            ['key' => 'policy_number', 'label' => 'No. Polis', 'type' => 'text'],
+            ['key' => 'customer', 'label' => 'Customer', 'type' => 'text'],
+            ['key' => 'insurer', 'label' => 'Insurer', 'type' => 'text'],
+            ['key' => 'type', 'label' => 'Jenis', 'type' => 'text'],
+            ['key' => 'premium', 'label' => 'Premi (+/-)', 'type' => 'money'],
+            ['key' => 'fees', 'label' => 'Biaya', 'type' => 'money'],
+            ['key' => 'commission', 'label' => 'Komisi (+/-)', 'type' => 'money'],
+            ['key' => 'settled', 'label' => 'Pelunasan', 'type' => 'text'],
+            ['key' => 'commission_status', 'label' => 'Status Komisi', 'type' => 'text'],
+        ],
+        'rows' => $rows, 'totals' => reportTotals($rows, ['premium', 'fees', 'commission']),
+    ];
+}
+
+/** Every note billed to a customer (or customer group): original debit notes, endorsement notes, multi-year premiums. */
+function reportStatement($conn, string $cid, array $q): array {
+    require_once __DIR__ . '/../helpers/db.php';
+    $group = trim((string)($q['group_id'] ?? ''));
+    $customer = trim((string)($q['customer_id'] ?? ''));
+    if ($group === '' && $customer === '') Response::validationError(['customer_id' => 'customer_id atau group_id wajib diisi']);
+    $scopeSql = $group !== '' ? 'c.group_id = ?' : 'c.customer_id = ?';
+    $scope = $group !== '' ? $group : $customer;
+    $name = $group !== '' ? dbValue($conn, "SELECT name FROM {app}.customer_groups WHERE group_id = ? AND company_id = ?", [$group, $cid])
+                          : dbValue($conn, "SELECT display_name FROM {app}.customers WHERE customer_id = ? AND company_id = ?", [$customer, $cid]);
+    if ($name === null) throw ApiException::from('ERR_V21_004');
+
+    $rows = dbAll($conn, "SELECT p.coverage_start AS doc_date, COALESCE(p.debit_note_number, '-') AS note, 'Nota debit polis' AS kind,
+            p.policy_number, c.display_name AS customer,
+            COALESCE(p.issued_customer_premium, p.customer_premium_amount) AS amount,
+            IF(p.payment_status IN ('paid', 'confirmed'), COALESCE(p.issued_customer_premium, p.customer_premium_amount), 0) AS paid,
+            p.payment_date AS paid_date
+        FROM {app}.policies p JOIN {app}.customers c ON c.customer_id = p.customer_id
+        WHERE p.company_id = ? AND $scopeSql AND p.coverage_end >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+        UNION ALL
+        SELECT e.effective_date, COALESCE(e.note_number, '-'), IF(e.note_type = 'credit', 'Nota kredit endorsemen', 'Nota debit endorsemen'),
+            p.policy_number, c.display_name, (e.premium_delta + e.materai_amount + e.biaya_polis),
+            IF(e.settled_date IS NOT NULL, e.premium_delta + e.materai_amount + e.biaya_polis, 0), e.settled_date
+        FROM {app}.policy_endorsements e JOIN {app}.policies p ON p.policy_id = e.policy_id JOIN {app}.customers c ON c.customer_id = p.customer_id
+        WHERE e.company_id = ? AND $scopeSql AND e.is_void = 0 AND e.note_type <> 'none'
+        UNION ALL
+        SELECT y.period_start, CONCAT('Tahun ke-', y.year_no), 'Premi multi-tahun', p.policy_number, c.display_name, y.premium_amount,
+            IF(y.paid_date IS NOT NULL, y.premium_amount, 0), y.paid_date
+        FROM {app}.policy_year_schedule y JOIN {app}.policies p ON p.policy_id = y.policy_id JOIN {app}.customers c ON c.customer_id = p.customer_id
+        WHERE y.company_id = ? AND $scopeSql AND y.year_no > 1
+        ORDER BY doc_date", [$cid, $scope, $cid, $scope, $cid, $scope]);
+    foreach ($rows as &$r) {
+        $r['amount'] = (int)$r['amount'];
+        $r['paid'] = (int)$r['paid'];
+        $r['outstanding'] = $r['amount'] - $r['paid'];
+    }
+    unset($r);
+    return [
+        'title'   => 'Rekening Koran (Statement of Account) — ' . $name . ' — ' . date('d/m/Y'),
+        'columns' => [
+            ['key' => 'doc_date', 'label' => 'Tanggal', 'type' => 'date'],
+            ['key' => 'note', 'label' => 'No. Nota', 'type' => 'text'],
+            ['key' => 'kind', 'label' => 'Jenis', 'type' => 'text'],
+            ['key' => 'policy_number', 'label' => 'No. Polis', 'type' => 'text'],
+            ['key' => 'customer', 'label' => 'Customer', 'type' => 'text'],
+            ['key' => 'amount', 'label' => 'Tagihan', 'type' => 'money'],
+            ['key' => 'paid', 'label' => 'Dibayar', 'type' => 'money'],
+            ['key' => 'outstanding', 'label' => 'Sisa', 'type' => 'money'],
+            ['key' => 'paid_date', 'label' => 'Tgl Bayar', 'type' => 'date'],
+        ],
+        'rows' => $rows, 'totals' => reportTotals($rows, ['amount', 'paid', 'outstanding']),
+    ];
+}
+
 // ── Excel export ──────────────────────────────────────────────────────────────
 
 function reportExportXlsx(array $report, string $slug): void {
@@ -462,6 +615,9 @@ try {
         'sub-agent-production'  => reportSubAgentProduction($conn, $cid, $_GET, $year),
         'claims'                => reportClaims($conn, $cid, $_GET, $year),
         'commission-list'       => reportCommissionList($conn, $cid, $_GET),
+        'accumulation'          => reportAccumulation($conn, $cid, $_GET),
+        'endorsements'          => reportEndorsements($conn, $cid, $_GET, $year),
+        'statement'             => reportStatement($conn, $cid, $_GET),
         default                 => null,
     };
     if ($report === null) { jsonResponse(404, 'Route not found'); exit; }

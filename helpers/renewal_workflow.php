@@ -3,13 +3,15 @@
 // Renewal quote workflow (migration_renewal_workflow.sql). Used by renewals/index.php and by
 // policies/renew.php, which moves the workflow to 'issued'.
 
-const RWF_STAGES = ['not_started', 'terms_requested', 'terms_received', 'offered', 'accepted', 'declined', 'issued'];
+// [v2.1.0] awaiting_ri: the insurer needs facultative reinsurance support before it can quote a large risk.
+const RWF_STAGES = ['not_started', 'terms_requested', 'awaiting_ri', 'terms_received', 'offered', 'accepted', 'declined', 'issued'];
 const RWF_LOST_REASONS = ['price', 'competitor', 'service', 'no_longer_needed', 'asset_sold', 'no_response', 'other'];
 
 // Allowed moves. 'issued' is reached only through POST /policies/{id}/renew.
 const RWF_TRANSITIONS = [
     'not_started'     => ['terms_requested', 'declined'],
-    'terms_requested' => ['terms_received', 'declined'],
+    'terms_requested' => ['awaiting_ri', 'terms_received', 'declined'],
+    'awaiting_ri'     => ['terms_received', 'declined'],
     'terms_received'  => ['terms_requested', 'offered', 'declined'],
     'offered'         => ['terms_received', 'accepted', 'declined'],
     'accepted'        => ['offered', 'declined'],

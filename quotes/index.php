@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/../helpers/db.php';
+
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/sales.php';
@@ -25,12 +27,56 @@ function findQuote($conn, string $quote_id, string $company_id): array {
 
 function quoteWithOptions($conn, string $quote_id, string $company_id): array {
     $quote = findQuote($conn, $quote_id, $company_id);
+    $quote['items'] = quoteItemsFor($conn, $quote_id);
     $quote['options'] = quoteOptionsFor($conn, $company_id, $quote_id);
     return $quote;
 }
 
+// ── [v2.1.0] Itemised quotes, placement tracking, structured terms, co-insurance panels ──
+
+const QUOTE_PLACEMENT_STATUSES = ['draft', 'submitted', 'quoted', 'declined', 'referred', 'awaiting_ri'];
+const QUOTE_MAX_ITEMS = 60;
+
+/** Items of an itemised quote: [{coverage_type, label, sum_insured, count_in_tsi}]. Null when not sent. */
+function quoteParseItems(mixed $items): ?array {
+    if ($items === null) return null;
+    if (!is_array($items) || count($items) > QUOTE_MAX_ITEMS) throw ApiException::from('ERR_V21_012', ['max' => QUOTE_MAX_ITEMS]);
+    $out = [];
+    foreach (array_values($items) as $i => $it) {
+        $it = is_array($it) ? $it : [];
+        $type = inText($it, 'coverage_type', 30, true);
+        $out[] = [
+            'coverage_type' => $type,
+            'label' => inText($it, 'label', 150),
+            'sum_insured' => inMoney($it, 'sum_insured', true),
+            'count_in_tsi' => inBool($it, 'count_in_tsi') ?? 1,
+            'sort_order' => $i,
+        ];
+    }
+    return $out;
+}
+
+/** Inserts items; returns their new ids by position. */
+function quoteInsertItems($conn, string $company_id, string $quote_id, array $items): array {
+    $ids = [];
+    foreach ($items as $it) {
+        $id = dbNewId('qit');
+        dbInsert($conn, 'quote_items', $it + ['item_id' => $id, 'quote_id' => $quote_id, 'company_id' => $company_id]);
+        $ids[] = $id;
+    }
+    return $ids;
+}
+
+/** Structured terms offered by an option (same shape as policy terms; coverage_index refers to the quote items). */
+function quoteParseOptionTerms(mixed $terms, int $item_count): ?string {
+    if ($terms === null || $terms === []) return null;
+    require_once __DIR__ . '/../helpers/policy_terms.php';
+    $rows = termsParseList($terms, $item_count);
+    return json_encode($rows, JSON_UNESCAPED_UNICODE);
+}
+
 /** Validates the option list. Premium is rate-based unless a premium is typed in. */
-function quoteParseOptions($conn, string $company_id, mixed $options, int $sum_insured): array {
+function quoteParseOptions($conn, string $company_id, mixed $options, int $sum_insured, ?array $items = null): array {
     if (!is_array($options) || count($options) < 1 || count($options) > QUOTE_MAX_OPTIONS) {
         throw ApiException::from('ERR_QUOTE_002', ['max' => QUOTE_MAX_OPTIONS]);
     }
@@ -52,11 +98,32 @@ function quoteParseOptions($conn, string $company_id, mixed $options, int $sum_i
             }
             $rate = number_format((float)$o['rate_permille'], 4, '.', '');
         }
+        // [v2.1.0] Itemised quotes: one rate per item, premium = Σ item SI × rate.
+        $item_rates = [];
+        if ($items) {
+            $given = $o['item_rates'] ?? null;
+            if (!is_array($given) || count($given) !== count($items)) {
+                if (($o['placement_status'] ?? 'quoted') === 'quoted' && !isset($o['premium_amount'])) {
+                    throw ApiException::from('ERR_V21_002', ['field' => "options[$i].item_rates"]);
+                }
+                $given = [];
+            }
+            foreach (array_values($given) as $k => $r) {
+                $rv = is_array($r) ? ($r['rate_permille'] ?? null) : $r;
+                if (!is_numeric($rv) || (float)$rv < 0 || (float)$rv > 1000) throw ApiException::from('ERR_SALES_003', ['field' => "options[$i].item_rates[$k]"]);
+                $item_rates[] = ['index' => $k, 'rate_permille' => round((float)$rv, 4), 'premium_amount' => (int)round($items[$k]['sum_insured'] * (float)$rv / 1000)];
+            }
+        }
+        $placement = inEnum($o, 'placement_status', QUOTE_PLACEMENT_STATUSES) ?? 'quoted';
         $premium_given = isset($o['premium_amount']) && $o['premium_amount'] !== '' && $o['premium_amount'] !== null;
         if ($premium_given) {
             $premium = salesMoney($o['premium_amount'], "options[$i].premium_amount");
+        } elseif ($item_rates) {
+            $premium = array_sum(array_column($item_rates, 'premium_amount'));
         } elseif ($rate !== null) {
             $premium = (int)round($sum_insured * (float)$rate / 1000);
+        } elseif ($placement !== 'quoted') {
+            $premium = 0; // still with the insurer, or declined: no price yet
         } else {
             throw ApiException::from('ERR_QUOTE_005');
         }
@@ -69,21 +136,31 @@ function quoteParseOptions($conn, string $company_id, mixed $options, int $sum_i
             'deductible_note' => salesText($o['deductible_note'] ?? null, "options[$i].deductible_note", 300),
             'terms_note'      => salesText($o['terms_note'] ?? null, "options[$i].terms_note", 4000),
             'sort_order'      => $i,
+            'placement_status' => $placement,
+            'submitted_date'  => inDate($o, 'submitted_date'),
+            'responded_date'  => inDate($o, 'responded_date'),
+            'decline_reason'  => inText($o, 'decline_reason', 300),
+            'info_supplied'   => inText($o, 'info_supplied', 500),
+            'share_percent'   => inNumber($o, 'share_percent', 0.01, 100),
+            'is_leader'       => inBool($o, 'is_leader') ?? 0,
+            'terms_json'      => quoteParseOptionTerms($o['terms'] ?? null, $items ? count($items) : 0),
+            'item_rates'      => $item_rates,
         ];
     }
     return $rows;
 }
 
-function quoteInsertOptions($conn, string $company_id, string $quote_id, array $rows): bool {
-    $qid = mysqli_real_escape_string($conn, $quote_id);
+function quoteInsertOptions($conn, string $company_id, string $quote_id, array $rows, array $item_ids = []): bool {
     foreach ($rows as $r) {
         $id = 'qop_' . bin2hex(random_bytes(10));
-        $ok = mysqli_query($conn, "INSERT INTO " . APP_SCHEMA . ".quote_options
-            (option_id, quote_id, company_id, insurer_id, rate_permille, premium_amount, biaya_polis, materai_amount, deductible_note, terms_note, sort_order)
-            VALUES ('$id', '$qid', '$company_id', " . salesSql($conn, $r['insurer_id']) . ", " . salesSql($conn, $r['rate_permille']) . ",
-                {$r['premium_amount']}, {$r['biaya_polis']}, {$r['materai_amount']}, " . salesSql($conn, $r['deductible_note']) . ",
-                " . salesSql($conn, $r['terms_note']) . ", {$r['sort_order']})");
-        if (!$ok) return false;
+        $item_rates = $r['item_rates'] ?? [];
+        unset($r['item_rates']);
+        dbInsert($conn, 'quote_options', $r + ['option_id' => $id, 'quote_id' => $quote_id, 'company_id' => $company_id]);
+        foreach ($item_rates as $ir) {
+            if (!isset($item_ids[$ir['index']])) continue;
+            dbInsert($conn, 'quote_option_items', ['option_id' => $id, 'item_id' => $item_ids[$ir['index']],
+                'rate_permille' => $ir['rate_permille'], 'premium_amount' => $ir['premium_amount']]);
+        }
     }
     return true;
 }
@@ -139,7 +216,10 @@ function createQuote($conn, string $company_id, array $input, string $username):
     if (in_array($stage, ['won', 'lost'], true)) throw ApiException::from('ERR_QUOTE_007');
 
     $row     = quoteParseFields($input);
-    $options = quoteParseOptions($conn, $company_id, $input['options'] ?? null, $row['sum_insured']);
+    $items   = quoteParseItems($input['items'] ?? null);
+    if ($items) $row['sum_insured'] = array_sum(array_map(fn($i) => $i['count_in_tsi'] ? $i['sum_insured'] : 0, $items));
+    $options = quoteParseOptions($conn, $company_id, $input['options'] ?? null, $row['sum_insured'], $items);
+    $currency = inCurrency($input);
     $usr     = mysqli_real_escape_string($conn, $username);
     $quote_id = 'qte_' . bin2hex(random_bytes(10));
 
@@ -153,7 +233,9 @@ function createQuote($conn, string $company_id, array $input, string $username):
                 VALUES ('$quote_id', '$company_id', '$number', '$pid', " . salesSql($conn, $row['product_type']) . ", " . salesSql($conn, $row['object_description']) . ",
                     {$row['sum_insured']}, " . salesSql($conn, $row['coverage_start']) . ", " . salesSql($conn, $row['coverage_end']) . ",
                     " . salesSql($conn, $row['valid_until']) . ", " . salesSql($conn, $row['notes']) . ", '$usr')");
-            if (!quoteInsertOptions($conn, $company_id, $quote_id, $options)) throw new RuntimeException(mysqli_error($conn));
+            $item_ids = $items ? quoteInsertItems($conn, $company_id, $quote_id, $items) : [];
+            if (!quoteInsertOptions($conn, $company_id, $quote_id, $options, $item_ids)) throw new RuntimeException(mysqli_error($conn));
+            if ($currency) dbUpdate($conn, 'quotes', $currency, ['quote_id' => $quote_id]);
             // First quote moves a new / contacted prospect to "quoted".
             mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".prospects SET stage = 'quoted', stage_changed_at = NOW(), updated_by = '$usr'
                 WHERE prospect_id = '$pid' AND company_id = '$company_id' AND stage IN ('new', 'contacted')");
@@ -174,11 +256,17 @@ function updateQuote($conn, string $company_id, string $quote_id, array $input, 
     if (!in_array($current['status'], ['draft', 'sent'], true)) throw ApiException::from('ERR_QUOTE_009', ['status' => $current['status']]);
 
     $row = quoteParseFields($input, $current);
+    $items = array_key_exists('items', $input) ? (quoteParseItems($input['items']) ?? []) : null;
+    if ($items) $row['sum_insured'] = array_sum(array_map(fn($i) => $i['count_in_tsi'] ? $i['sum_insured'] : 0, $items));
+    // Option rates refer to items, so new items need the options again.
+    if ($items !== null && !array_key_exists('options', $input)) throw ApiException::from('ERR_QUOTE_010');
+    $currentItems = $items === null ? quoteItemsFor($conn, $quote_id) : null;
     $options = array_key_exists('options', $input)
-        ? quoteParseOptions($conn, $company_id, $input['options'], $row['sum_insured'])
+        ? quoteParseOptions($conn, $company_id, $input['options'], $row['sum_insured'], $items ?? ($currentItems ?: null))
         : null;
     // A changed sum insured makes rate-based premiums stale; require the options again.
     if ($options === null && $row['sum_insured'] !== $current['sum_insured']) throw ApiException::from('ERR_QUOTE_010');
+    $currency = inCurrency($input);
 
     $id  = mysqli_real_escape_string($conn, $quote_id);
     $usr = mysqli_real_escape_string($conn, $username);
@@ -190,9 +278,19 @@ function updateQuote($conn, string $company_id, string $quote_id, array $input, 
             notes = " . salesSql($conn, $row['notes']) . ", updated_by = '$usr'
         WHERE quote_id = '$id' AND company_id = '$company_id'");
     if ($ok && $options !== null) {
+        // Item ids: new items are re-inserted; otherwise the existing ones keep their ids.
+        if ($items !== null) {
+            mysqli_query($conn, "DELETE oi FROM " . APP_SCHEMA . ".quote_option_items oi JOIN " . APP_SCHEMA . ".quote_options o ON o.option_id = oi.option_id WHERE o.quote_id = '$id'");
+            mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".quote_items WHERE quote_id = '$id'");
+            $item_ids = $items ? quoteInsertItems($conn, $company_id, $quote_id, $items) : [];
+        } else {
+            mysqli_query($conn, "DELETE oi FROM " . APP_SCHEMA . ".quote_option_items oi JOIN " . APP_SCHEMA . ".quote_options o ON o.option_id = oi.option_id WHERE o.quote_id = '$id'");
+            $item_ids = array_column($currentItems ?? [], 'item_id');
+        }
         $ok = mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".quote_options WHERE quote_id = '$id' AND company_id = '$company_id'")
-            && quoteInsertOptions($conn, $company_id, $quote_id, $options);
+            && quoteInsertOptions($conn, $company_id, $quote_id, $options, $item_ids);
     }
+    if ($ok && $currency) dbUpdate($conn, 'quotes', $currency, ['quote_id' => $quote_id]);
     if (!$ok) {
         error_log('updateQuote: ' . mysqli_error($conn));
         mysqli_rollback($conn);
@@ -246,8 +344,21 @@ function acceptQuote($conn, string $company_id, string $quote_id, array $input, 
     $res = mysqli_query($conn, "SELECT option_id FROM " . APP_SCHEMA . ".quote_options WHERE option_id = '$oid' AND quote_id = '$qid' AND company_id = '$company_id' LIMIT 1");
     if (!$res || mysqli_num_rows($res) === 0) throw ApiException::from('ERR_QUOTE_013');
 
+    // [v2.1.0] Co-insurance: the accepted option leads; panel_option_ids are the followers. Shares must total 100%.
+    $panel = null;
+    if (!empty($input['panel_option_ids'])) {
+        if (!is_array($input['panel_option_ids'])) throw ApiException::from('ERR_V21_001', ['field' => 'panel_option_ids']);
+        $ids = array_values(array_unique(array_merge([(string)$input['option_id']], array_map('strval', $input['panel_option_ids']))));
+        $opts = dbAll($conn, "SELECT option_id, share_percent FROM {app}.quote_options WHERE quote_id = ? AND company_id = ? AND option_id IN ("
+            . implode(',', array_fill(0, count($ids), '?')) . ")", [$quote_id, $company_id, ...$ids]);
+        if (count($opts) !== count($ids)) throw ApiException::from('ERR_V21_019');
+        $total = round(array_sum(array_map(fn($o) => (float)$o['share_percent'], $opts)), 2);
+        if (abs($total - 100) > 0.01) throw ApiException::from('ERR_V21_020', ['total' => $total]);
+        $panel = json_encode($ids);
+    }
+
     $usr = mysqli_real_escape_string($conn, $username);
-    if (!mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".quotes SET status = 'accepted', accepted_option_id = '$oid', updated_by = '$usr'
+    if (!mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".quotes SET status = 'accepted', accepted_option_id = '$oid', accepted_panel = " . salesSql($conn, $panel) . ", updated_by = '$usr'
             WHERE quote_id = '$qid' AND company_id = '$company_id'")) {
         throw ApiException::from('ERR_QUOTE_008');
     }
@@ -255,6 +366,30 @@ function acceptQuote($conn, string $company_id, string $quote_id, array $input, 
     mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".prospects SET stage = 'negotiating', stage_changed_at = NOW(), updated_by = '$usr'
         WHERE prospect_id = '$pid' AND company_id = '$company_id' AND stage IN ('new', 'contacted', 'quoted')");
     jsonResponse(200, 'Quote accepted', quoteWithOptions($conn, $quote_id, $company_id));
+}
+
+/** [v2.1.0] PUT /quotes/{id}/options/{oid}/placement — move one insurer's submission along without re-sending the quote. */
+function updateOptionPlacement($conn, string $company_id, string $quote_id, string $option_id, array $in, string $username): void {
+    $current = findQuote($conn, $quote_id, $company_id);
+    if (!in_array($current['status'], ['draft', 'sent'], true)) throw ApiException::from('ERR_QUOTE_009', ['status' => $current['status']]);
+    if (!dbOne($conn, "SELECT 1 FROM {app}.quote_options WHERE option_id = ? AND quote_id = ? AND company_id = ?", [$option_id, $quote_id, $company_id])) {
+        throw ApiException::from('ERR_QUOTE_013');
+    }
+    $set = inPresent($in, [
+        'placement_status' => fn($i) => inEnum($i, 'placement_status', QUOTE_PLACEMENT_STATUSES, true),
+        'submitted_date' => fn($i) => inDate($i, 'submitted_date'),
+        'responded_date' => fn($i) => inDate($i, 'responded_date'),
+        'decline_reason' => fn($i) => inText($i, 'decline_reason', 300),
+        'info_supplied' => fn($i) => inText($i, 'info_supplied', 500),
+        'share_percent' => fn($i) => inNumber($i, 'share_percent', 0.01, 100),
+        'is_leader' => fn($i) => inBool($i, 'is_leader') ?? 0,
+        'premium_amount' => fn($i) => inMoney($i, 'premium_amount'),
+    ]);
+    if (($set['placement_status'] ?? null) === 'submitted' && empty($set['submitted_date'])) $set['submitted_date'] = date('Y-m-d');
+    if (in_array($set['placement_status'] ?? null, ['quoted', 'declined'], true) && empty($set['responded_date'])) $set['responded_date'] = date('Y-m-d');
+    if (!$set) throw ApiException::from('ERR_V21_002', ['field' => 'data']);
+    dbUpdate($conn, 'quote_options', $set, ['option_id' => $option_id]);
+    jsonResponse(200, 'Placement updated', quoteWithOptions($conn, $quote_id, $company_id));
 }
 
 function linkQuotePolicy($conn, string $company_id, string $quote_id, array $input, string $username): void {
@@ -287,7 +422,11 @@ try {
     $conn       = getConn();
     $company_id = mysqli_real_escape_string($conn, $company_id);
 
-    if ($action !== '' && $sub_action === 'status') {
+    if ($action !== '' && $sub_action === 'options' && ($parts[5] ?? '') !== '' && ($parts[6] ?? '') === 'placement') {
+        if ($method !== 'PUT') Response::methodNotAllowed();
+        updateOptionPlacement($conn, $company_id, $action, $parts[5], input(), $username);
+
+    } elseif ($action !== '' && $sub_action === 'status') {
         if ($method !== 'PUT') Response::methodNotAllowed();
         changeQuoteStatus($conn, $company_id, $action, input(), $username);
 

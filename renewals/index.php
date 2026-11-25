@@ -1,4 +1,6 @@
 <?php
+
+require_once __DIR__ . '/../helpers/claims.php';
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
@@ -66,8 +68,8 @@ function getRenewalList($conn, $company_id, $month, $renewal_status, $page, $lim
             (SELECT w.lost_reason FROM " . APP_SCHEMA . ".renewal_workflows w WHERE w.policy_id = p.policy_id) AS lost_reason,
             (SELECT COUNT(*) FROM " . APP_SCHEMA . ".claims cl
              WHERE cl.policy_id = p.policy_id AND cl.is_deleted = 0) AS claim_count,
-            (SELECT COALESCE(SUM(COALESCE(cl.settlement_amount, cl.approved_amount)), 0) FROM " . APP_SCHEMA . ".claims cl
-             WHERE cl.policy_id = p.policy_id AND cl.is_deleted = 0 AND cl.status IN ('approved', 'paid')) AS claims_incurred
+            (SELECT COALESCE(SUM(" . claimIncurredSql('cl') . "), 0) FROM " . APP_SCHEMA . ".claims cl
+             WHERE cl.policy_id = p.policy_id AND cl.is_deleted = 0) AS claims_incurred
         FROM " . APP_SCHEMA . ".policies p
         LEFT JOIN " . APP_SCHEMA . ".customers c ON c.customer_id = p.customer_id
         LEFT JOIN " . APP_SCHEMA . ".insurers  i ON i.insurer_id  = p.insurer_id

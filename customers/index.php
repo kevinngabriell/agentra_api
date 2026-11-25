@@ -758,6 +758,21 @@ try {
         if ($method !== 'GET') { jsonResponse(405, 'Method Not Allowed'); }
         getCustomerCrossSell($conn, $company_id, $customer_id, $_GET);
 
+    // [v2.1.0] APU-PPT compliance and beneficial owners.
+    } elseif ($customer_id && $sub_action === 'compliance') {
+        require_once __DIR__ . '/compliance.php';
+        if ($method === 'GET') getCustomerCompliance($conn, $company_id, $customer_id);
+        elseif ($method === 'PUT') updateCustomerCompliance($conn, $company_id, $customer_id, input(), $username);
+        else jsonResponse(405, 'Method Not Allowed');
+
+    } elseif ($customer_id && $sub_action === 'beneficial-owners') {
+        require_once __DIR__ . '/compliance.php';
+        $oid = $parts[5] ?? '';
+        if ($oid === '' && $method === 'POST') saveBeneficialOwner($conn, $company_id, $customer_id, null, input(), $username);
+        elseif ($oid !== '' && $method === 'PUT') saveBeneficialOwner($conn, $company_id, $customer_id, $oid, input(), $username);
+        elseif ($oid !== '' && $method === 'DELETE') deleteBeneficialOwner($conn, $company_id, $customer_id, $oid);
+        else jsonResponse(405, 'Method Not Allowed');
+
     } elseif ($customer_id && $sub_action === 'group') {
         if ($method !== 'PUT') { jsonResponse(405, 'Method Not Allowed'); }
         setCustomerGroup($conn, $company_id, $customer_id, input(), $username);
