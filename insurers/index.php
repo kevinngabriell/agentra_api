@@ -2,6 +2,8 @@
 
 require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
+require_once __DIR__ . '/../helpers/db.php';
+require_once __DIR__ . '/../helpers/product_types.php';
 
 // --- GET ALL ---
 function getAllInsurers($conn, $company_id, $is_active = null){
@@ -12,7 +14,7 @@ function getAllInsurers($conn, $company_id, $is_active = null){
         $where .= " AND is_active = " . ($is_active ? 1 : 0);
     }
 
-    $result = mysqli_query($conn, "SELECT insurer_id, name, short_name, agent_code, is_primary, is_active, notes, created_at FROM " . APP_SCHEMA . ".insurers WHERE $where ORDER BY is_primary DESC, name ASC");
+    $result = mysqli_query($conn, "SELECT insurer_id, name, short_name, agent_code, is_primary, is_active, notes, assistance_phone, created_at FROM " . APP_SCHEMA . ".insurers WHERE $where ORDER BY is_primary DESC, name ASC");
 
     if ($result && mysqli_num_rows($result) > 0) {
         $data = mysqli_fetch_all($result, MYSQLI_ASSOC);
@@ -20,6 +22,40 @@ function getAllInsurers($conn, $company_id, $is_active = null){
     } else {
         jsonResponse(404, 'No insurers found');
     }
+}
+
+// ── [v2.1.0] Default commission per product line at this insurer (insurer_commission_rates) ──
+//   GET  /insurers/{id}/products   one row per line in PRODUCT_TYPES (rows not yet set come back inactive at 0%)
+//   POST /insurers/{id}/products   upsert {product_type, commission_rate, is_active}
+// When a row is active its rate is used for new policies of that line at this insurer (policies/index.php).
+
+function insurerProductsFind($conn, string $company_id, string $insurer_id): void {
+    if (!dbOne($conn, "SELECT 1 FROM {app}.insurers WHERE insurer_id = ? AND company_id = ?", [$insurer_id, $company_id])) throw ApiException::from('ERR_INS_001');
+}
+
+function getInsurerProducts($conn, string $company_id, string $insurer_id): void {
+    insurerProductsFind($conn, $company_id, $insurer_id);
+    $rows = dbAll($conn, "SELECT rate_id, product_type, rate_percent, is_active FROM {app}.insurer_commission_rates WHERE insurer_id = ?", [$insurer_id]);
+    $by = array_column($rows, null, 'product_type');
+    $out = [];
+    foreach (PRODUCT_TYPES as $code => $t) {
+        $r = $by[$code] ?? null;
+        $out[] = ['insurer_product_id' => $r['rate_id'] ?? null, 'insurer_id' => $insurer_id, 'product_type' => $code, 'label' => $t['label'],
+                  'commission_rate' => $r ? (float)$r['rate_percent'] : 0.0, 'is_active' => $r ? (bool)(int)$r['is_active'] : false];
+    }
+    jsonResponse(200, 'Insurer products', ['data' => $out]);
+}
+
+function upsertInsurerProduct($conn, string $company_id, string $insurer_id, array $in, string $username): void {
+    insurerProductsFind($conn, $company_id, $insurer_id);
+    $type = inEnum($in, 'product_type', array_keys(PRODUCT_TYPES), true);
+    $rate = inNumber($in, 'commission_rate', 0, 100, true);
+    $active = inBool($in, 'is_active') ?? 1;
+    dbExec($conn, "INSERT INTO {app}.insurer_commission_rates (rate_id, insurer_id, product_type, rate_percent, is_active, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON DUPLICATE KEY UPDATE rate_percent = VALUES(rate_percent), is_active = VALUES(is_active), updated_by = VALUES(created_by)",
+        [dbNewId('icr'), $insurer_id, $type, round($rate, 2), $active, $username]);
+    getInsurerProducts($conn, $company_id, $insurer_id);
 }
 
 // --- CREATE ---
@@ -137,6 +173,12 @@ function updateInsurer($conn, $insurer_id, $input, $username, $company_id){
         $updates[] = "notes = " . ($notes !== '' ? "'$notes'" : 'NULL');
     }
 
+    // [v2.1.0] 24-hour emergency assistance number (travel / motor), printed on certificates and sent before departure.
+    if (array_key_exists('assistance_phone', $input)) {
+        $ap = inText($input, 'assistance_phone', 40);
+        $updates[] = "assistance_phone = " . ($ap !== null ? "'" . mysqli_real_escape_string($conn, $ap) . "'" : 'NULL');
+    }
+
     if (isset($input['is_primary'])) {
         $is_primary = !empty($input['is_primary']) ? 1 : 0;
         if ($is_primary) {
@@ -218,7 +260,11 @@ $insurer_id = !empty($action) ? $action : null;
 try {
     $conn = getConn();
 
-    if ($insurer_id) {
+    if ($insurer_id && ($parts[4] ?? '') === 'products') {
+        if ($method === 'GET') getInsurerProducts($conn, $company_id, $insurer_id);
+        elseif ($method === 'POST') upsertInsurerProduct($conn, $company_id, $insurer_id, input(), $username);
+        else jsonResponse(405, 'Method Not Allowed');
+    } elseif ($insurer_id) {
         switch ($method) {
             case 'GET':
                 getDetailInsurer($conn, $insurer_id, $company_id);
@@ -250,6 +296,8 @@ try {
         }
     }
 
+} catch (ApiException $e) {
+    throw $e;
 } catch (\Throwable $e) {
     RequestLogger::setException($e);
     error_log($e->getMessage());

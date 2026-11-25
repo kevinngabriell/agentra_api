@@ -4,6 +4,8 @@ require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
 require_once __DIR__ . '/../helpers/claims.php';
+require_once __DIR__ . '/../helpers/db.php';
+require_once __DIR__ . '/large_loss.php';
 
 // Claims registered against policies. Rules (status flow, deductible, document
 // checklist) live in helpers/claims.php; tables in migration_claims.sql.
@@ -67,18 +69,27 @@ function claimSelectSql(): string {
                 cl.date_of_loss, cl.reported_date, cl.cause, cl.loss_location, cl.description,
                 cl.estimated_loss, cl.deductible, cl.approved_amount, cl.settlement_amount, cl.payment_date,
                 cl.status, cl.status_changed_at, cl.surveyor_name, cl.survey_date, cl.rejection_reason,
+                cl.currency, cl.exchange_rate, cl.estimated_loss_fc, cl.coverage_id, cl.claim_type, cl.value_at_risk, cl.salvage_amount,
+                cl.adjuster_firm, cl.adjuster_name, cl.adjuster_appointed_date, cl.prelim_report_date, cl.final_report_date,
+                cl.workshop_name, cl.spk_date, cl.own_risk_paid_date, cl.repair_status, cl.vehicle_handover_date, cl.bpkb_handover_date,
+                cl.notice_deadline, cl.docs_deadline, cl.decision_due, cl.payment_due,
+                pcv.coverage_type AS coverage_type, pcv.coverage_label AS coverage_label, pcv.sum_insured AS coverage_sum_insured,
                 cl.created_by, TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, ''))) AS created_by_name,
                 cl.created_at, cl.updated_at
             FROM " . APP_SCHEMA . ".claims cl
             JOIN " . APP_SCHEMA . ".policies p ON p.policy_id = cl.policy_id
             JOIN " . APP_SCHEMA . ".customers c ON c.customer_id = cl.customer_id
             LEFT JOIN " . APP_SCHEMA . ".insurers i ON i.insurer_id = p.insurer_id
+            LEFT JOIN " . APP_SCHEMA . ".policy_coverages pcv ON pcv.coverage_id = cl.coverage_id
             LEFT JOIN " . CORE_SCHEMA . ".app_user u ON u.user_id COLLATE utf8mb4_unicode_ci = cl.created_by";
 }
 
 function normalizeClaim(array $row): array {
     foreach (['estimated_loss', 'deductible', 'premium_amount', 'sum_insured'] as $k) $row[$k] = (int)$row[$k];
-    foreach (['approved_amount', 'settlement_amount'] as $k) $row[$k] = $row[$k] === null ? null : (int)$row[$k];
+    foreach (['approved_amount', 'settlement_amount', 'value_at_risk', 'coverage_sum_insured'] as $k) $row[$k] = $row[$k] === null ? null : (int)$row[$k];
+    $row['salvage_amount'] = (int)$row['salvage_amount'];
+    $row['exchange_rate'] = (float)$row['exchange_rate'];
+    $row['estimated_loss_fc'] = $row['estimated_loss_fc'] === null ? null : (float)$row['estimated_loss_fc'];
     $row['created_by_name'] = $row['created_by_name'] !== '' ? $row['created_by_name'] : null;
     $row['status_label']    = CLAIM_STATUS_LABELS[$row['status']] ?? $row['status'];
     return $row;
@@ -141,7 +152,7 @@ function listClaims($conn, string $company_id, array $q): void {
     $rows     = array_map('normalizeClaim', mysqli_fetch_all($result, MYSQLI_ASSOC));
     $provided = claimProvidedKeysFor($conn, $company_id, array_column($rows, 'claim_id'));
     foreach ($rows as &$row) {
-        [$row['docs_required'], $row['docs_provided']] = claimRequiredProgress($row['product_type'], $provided[$row['claim_id']] ?? []);
+        [$row['docs_required'], $row['docs_provided']] = claimRequiredProgress(claimCanonicalProduct($conn, $company_id, $row['product_type']), $provided[$row['claim_id']] ?? [], $row['cause']);
     }
     unset($row);
 
@@ -171,8 +182,8 @@ function getClaimSummary($conn, string $company_id): void {
             $open += $n;
             $open_estimated += (int)$row['estimated'];
         }
-        if ($row['status'] === 'approved') $approved_unpaid = (int)$row['approved'];
-        if ($row['status'] === 'paid')     $paid_total      = (int)$row['settled'];
+        if (in_array($row['status'], ['approved', 'partially_paid'], true)) $approved_unpaid += (int)$row['approved'] - (int)$row['settled'];
+        if (in_array($row['status'], ['paid', 'partially_paid'], true))     $paid_total      += (int)$row['settled'];
     }
 
     jsonResponse(200, 'Claim summary retrieved', [
@@ -211,10 +222,10 @@ function getClaimStats($conn, string $company_id, array $q): void {
             COALESCE(SUM(status = 'rejected'), 0) AS rejected_count,
             COALESCE(SUM(status = 'paid'), 0) AS paid_count,
             COALESCE(SUM(estimated_loss), 0) AS estimated_total,
-            COALESCE(SUM(CASE WHEN status IN ('approved', 'paid') THEN COALESCE(settlement_amount, approved_amount) ELSE 0 END), 0) AS incurred_total,
+            COALESCE(SUM(" . claimIncurredSql('claims') . "), 0) AS incurred_total,
             COALESCE(SUM(settlement_amount), 0) AS settled_total,
             MAX(date_of_loss) AS last_claim_date
-        FROM " . APP_SCHEMA . ".claims WHERE $claimWhere"));
+        FROM " . APP_SCHEMA . ".claims claims WHERE $claimWhere"));
     $premium = (int)mysqli_fetch_assoc(mysqli_query($conn,
         "SELECT COALESCE(SUM(premium_amount), 0) AS total FROM " . APP_SCHEMA . ".policies WHERE $policyWhere"))['total'];
 
@@ -238,8 +249,10 @@ function getClaimDetail($conn, string $company_id, string $claim_id): void {
     $claim = findClaim($conn, $claim_id, $company_id);
 
     $provided = claimProvidedKeysFor($conn, $company_id, [$claim['claim_id']])[$claim['claim_id']] ?? [];
-    $checklist = claimChecklist($claim['product_type'], $provided);
-    [$claim['docs_required'], $claim['docs_provided']] = claimRequiredProgress($claim['product_type'], $provided);
+    $canonical = claimCanonicalProduct($conn, $company_id, $claim['product_type']);
+    $checklist = claimChecklist($canonical, $provided, $claim['cause']);
+    [$claim['docs_required'], $claim['docs_provided']] = claimRequiredProgress($canonical, $provided, $claim['cause']);
+    $claim['product_group'] = claimProductGroup($canonical);
 
     $id  = mysqli_real_escape_string($conn, $claim_id);
     $res = mysqli_query($conn, "SELECT e.event_id, e.event_type, e.from_status, e.to_status, e.channel, e.description,
@@ -258,6 +271,7 @@ function getClaimDetail($conn, string $company_id, string $claim_id): void {
 
     $claim['checklist'] = $checklist;
     $claim['events']    = $events;
+    $claim += claimLargeLossDetail($conn, $company_id, $claim);
     jsonResponse(200, 'Claim found', $claim);
 }
 
@@ -294,7 +308,16 @@ function createClaim($conn, string $company_id, array $input, string $username):
     }
 
     $estimated = claimMoney($input['estimated_loss'] ?? 0, 'estimated_loss');
-    $deductible = claimMoney($input['deductible'] ?? 0, 'deductible');
+    // [v2.1.0] New fields; a deductible left out is taken from the policy terms for this loss.
+    $extra = claimExtraSet($conn, $input, $policy['policy_id']);
+    if (!isset($input['deductible']) || $input['deductible'] === '' || $input['deductible'] === null) {
+        $si = !empty($extra['coverage_id'])
+            ? (int)dbValue($conn, "SELECT sum_insured FROM {app}.policy_coverages WHERE coverage_id = ?", [$extra['coverage_id']])
+            : (int)dbValue($conn, "SELECT sum_insured FROM {app}.policies WHERE policy_id = ?", [$policy['policy_id']]);
+        $deductible = claimDeductibleFromTerms(claimApplicableTerms($conn, $policy['policy_id'], $extra['coverage_id'] ?? null), $estimated, $si)[0];
+    } else {
+        $deductible = claimMoney($input['deductible'], 'deductible');
+    }
 
     $cause_s   = claimText($conn, $input['cause'], 200);
     $loc_s     = claimText($conn, $input['loss_location'] ?? '', 300);
@@ -318,6 +341,9 @@ function createClaim($conn, string $company_id, array $input, string $username):
                  $cause_s, $loc_s, $desc_s, $estimated, $deductible, 'reported', '$now', '$user_s', '$now')");
             insertClaimEvent($conn, $claim_id, $company_id, 'registered',
                 'Klaim didaftarkan. Estimasi kerugian ' . claimIdr($estimated), $username, null, 'reported', null, $reported_date);
+            if ($extra) dbUpdate($conn, 'claims', $extra, ['claim_id' => $claim_id]);
+            dbInsert($conn, 'claim_reserves', ['reserve_id' => dbNewId('crs'), 'claim_id' => $claim_id, 'company_id' => $company_id,
+                'reserve_date' => $reported_date, 'amount' => $estimated, 'source' => 'initial', 'created_by' => $username]);
             mysqli_commit($conn);
             break;
         } catch (\Throwable $e) {
@@ -394,6 +420,14 @@ function updateClaim($conn, string $company_id, string $claim_id, array $input, 
         }
     }
 
+    // [v2.1.0] Adjuster, motor repair, deadlines, underinsurance and currency fields.
+    foreach (claimExtraSet($conn, $input, $claim['policy_id']) as $col => $val) {
+        $cur = $claim[$col] ?? null;
+        if ((string)($cur ?? '') === (string)($val ?? '') || (is_numeric($cur) && is_numeric($val) && (float)$cur == (float)$val)) continue;
+        $updates[] = "`$col` = " . ($val === null ? 'NULL' : (is_int($val) || is_float($val) ? $val : "'" . mysqli_real_escape_string($conn, (string)$val) . "'"));
+        $changes[] = (CLAIM_EXTRA_LABELS[$col] ?? $col) . ' diperbarui';
+    }
+
     if (!$updates) throw ApiException::from('ERR_CLAIM_011');
 
     $updates[] = "updated_by = '" . mysqli_real_escape_string($conn, $username) . "'";
@@ -467,7 +501,22 @@ function changeClaimStatus($conn, string $company_id, string $claim_id, array $i
             $detail[] = 'Alasan: ' . mb_substr($reason, 0, 500);
             break;
 
+        case 'withdrawn':
+            if ($note === '') $missing['note'] = 'Alasan pencabutan wajib diisi';
+            break;
+
+        case 'appeal':
+            if ($note === '') $missing['note'] = 'Dasar banding wajib diisi';
+            break;
+
+        case 'partially_paid':
+            throw ApiException::from('ERR_V21_015', ['why' => 'catat pembayaran sebagian lewat menu Pembayaran Klaim']);
+
         case 'paid':
+            // [v2.1.0] With payment rows the claim is closed by recording the final payment instead.
+            if ((int)dbValue($conn, "SELECT COUNT(*) FROM {app}.claim_payments WHERE claim_id = ?", [$claim_id]) > 0) {
+                throw ApiException::from('ERR_V21_015', ['why' => 'klaim ini memakai pembayaran bertahap; catat pembayaran akhir']);
+            }
             if (!isset($input['settlement_amount']) || $input['settlement_amount'] === '') $missing['settlement_amount'] = 'settlement_amount wajib diisi';
             if (empty($input['payment_date'])) $missing['payment_date'] = 'payment_date wajib diisi';
             if ($missing) break;
@@ -486,8 +535,13 @@ function changeClaimStatus($conn, string $company_id, string $claim_id, array $i
         case 'documents_complete':
             // Reopening a rejected claim clears the old reason; it stays in the timeline.
             if ($from === 'rejected') $set[] = 'rejection_reason = NULL';
+            // [v2.1.0] The insurer's decision clock starts now.
+            $set[] = "decision_due = COALESCE(decision_due, DATE_ADD(CURDATE(), INTERVAL " . CLAIM_DECISION_DAYS . " DAY))";
             break;
     }
+    // [v2.1.0] Agreed amount → payment clock. A reopened paid claim starts collecting again.
+    if ($to === 'approved') $set[] = "payment_due = COALESCE(payment_due, DATE_ADD(CURDATE(), INTERVAL " . CLAIM_PAYMENT_DAYS . " DAY))";
+    if ($from === 'paid') $detail[] = 'Klaim dibuka kembali';
     if ($missing) Response::validationError($missing);
 
     $description = CLAIM_STATUS_LABELS[$from] . ' → ' . CLAIM_STATUS_LABELS[$to];
@@ -506,6 +560,11 @@ function changeClaimStatus($conn, string $company_id, string $claim_id, array $i
             throw ApiException::from('ERR_CLAIM_009', ['from' => CLAIM_STATUS_LABELS[$from], 'to' => CLAIM_STATUS_LABELS[$to]]);
         }
         insertClaimEvent($conn, $claim_id, $company_id, 'status_changed', $description, $username, $from, $to);
+        // [v2.1.0] A one-off "paid" becomes a final payment row, so the payment history stays complete.
+        if ($to === 'paid' && isset($settlement)) {
+            dbInsert($conn, 'claim_payments', ['payment_id' => dbNewId('cpy'), 'claim_id' => $claim_id, 'company_id' => $company_id,
+                'payment_date' => $payment_date, 'amount' => $settlement, 'payment_type' => 'final', 'created_by' => $username]);
+        }
         mysqli_commit($conn);
     } catch (ApiException $e) {
         throw $e;
@@ -601,6 +660,26 @@ try {
     } elseif ($action === 'stats') {
         if ($method !== 'GET') Response::methodNotAllowed();
         getClaimStats($conn, $company_id, $_GET);
+
+    } elseif ($action === 'deductible-preview') {
+        if ($method !== 'GET') Response::methodNotAllowed();
+        claimDeductiblePreview($conn, $company_id, $_GET);
+
+    } elseif ($action !== '' && $sub_action === 'reserves') {
+        if ($method !== 'POST') Response::methodNotAllowed();
+        addClaimReserve($conn, $company_id, $action, input(), $username);
+
+    } elseif ($action !== '' && $sub_action === 'payments') {
+        $pid = $parts[5] ?? '';
+        if ($pid === '' && $method === 'POST') addClaimPayment($conn, $company_id, $action, input(), $username);
+        elseif ($pid !== '' && $method === 'DELETE') deleteClaimPayment($conn, $company_id, $action, $pid, $username);
+        else Response::methodNotAllowed();
+
+    } elseif ($action !== '' && $sub_action === 'recoveries') {
+        $rid = $parts[5] ?? '';
+        if ($rid === '' && $method === 'POST') addClaimRecovery($conn, $company_id, $action, input(), $username);
+        elseif ($rid !== '' && $method === 'DELETE') deleteClaimRecovery($conn, $company_id, $action, $rid, $username);
+        else Response::methodNotAllowed();
 
     } elseif ($action !== '' && $sub_action === 'status') {
         if ($method !== 'PUT') Response::methodNotAllowed();

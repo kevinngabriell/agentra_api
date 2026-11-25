@@ -31,6 +31,10 @@ const DOC_TYPES = [
     'survey_photo'   => 'Foto Survei',
     'claim'          => 'Dokumen Klaim',
     'payment_proof'  => 'Bukti Bayar',
+    // [v2.1.0] Large accounts: covernote before the policy is printed, survey and adjuster reports.
+    'covernote'      => 'Covernote',
+    'survey_report'  => 'Laporan Survei',
+    'adjuster_report' => 'Laporan Adjuster',
     'other'          => 'Lainnya',
 ];
 
@@ -304,7 +308,7 @@ function uploadDocument($conn, string $company_id, string $username): void {
     $claim_number = null;
     if ($claim_id !== '') {
         $clid = mysqli_real_escape_string($conn, $claim_id);
-        $res  = mysqli_query($conn, "SELECT cl.policy_id, cl.claim_number, p.product_type
+        $res  = mysqli_query($conn, "SELECT cl.policy_id, cl.claim_number, cl.cause, p.product_type
             FROM " . APP_SCHEMA . ".claims cl JOIN " . APP_SCHEMA . ".policies p ON p.policy_id = cl.policy_id
             WHERE cl.claim_id = '$clid' AND cl.company_id = '$company_id' AND cl.is_deleted = 0 LIMIT 1");
         if (!$res || mysqli_num_rows($res) === 0) throw ApiException::from('ERR_DOC_020');
@@ -312,7 +316,7 @@ function uploadDocument($conn, string $company_id, string $username): void {
         if ($policy_id !== '' && $policy_id !== $claim['policy_id']) throw ApiException::from('ERR_DOC_009');
         $policy_id    = $claim['policy_id'];
         $claim_number = $claim['claim_number'];
-        if ($claim_requirement !== '' && !in_array($claim_requirement, claimRequirementKeys($claim['product_type']), true)) {
+        if ($claim_requirement !== '' && !in_array($claim_requirement, claimRequirementKeys(claimCanonicalProduct($conn, $company_id, $claim['product_type']), (string)$claim['cause']), true)) {
             throw ApiException::from('ERR_DOC_021');
         }
     } else {

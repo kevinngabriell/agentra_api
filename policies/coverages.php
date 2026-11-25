@@ -4,60 +4,9 @@ require_once __DIR__ . '/../general.php';
 require_once __DIR__ . '/../connection/db.php';
 require_once __DIR__ . '/../helpers/policy_log.php';
 require_once __DIR__ . '/../helpers/coverage.php';
+require_once __DIR__ . '/../helpers/endorsements.php';
 
-// Recomputes sum_insured, premium_amount, commission_amount AND the full
-// financial breakdown (commission_tax_amount, net_commission_amount,
-// customer_premium_amount) on the parent policy from its coverages.
-// Only rows with count_in_tsi=1 contribute to sum_insured (so duplicate clauses on the same object don't inflate TSI).
-// Also syncs the pending commission record so expected_amount stays accurate.
-function syncPolicyTotals($conn, $policy_id) {
-    $policy_id = mysqli_real_escape_string($conn, $policy_id);
-
-    mysqli_begin_transaction($conn);
-
-    $ok1 = mysqli_query($conn,
-        "UPDATE " . APP_SCHEMA . ".policies p
-         SET
-           p.sum_insured       = COALESCE((SELECT SUM(c.sum_insured)    FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id' AND c.count_in_tsi = 1), 0),
-           p.premium_amount    = COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0),
-           p.commission_amount = ROUND(
-             COALESCE((SELECT SUM(c.premium_amount) FROM " . APP_SCHEMA . ".policy_coverages c WHERE c.policy_id = '$policy_id'), 0)
-             * p.commission_rate / 100
-           )
-         WHERE p.policy_id = '$policy_id'"
-    );
-
-    // Previously this function updated only sum_insured / premium_amount /
-    // commission_amount — leaving commission_tax_amount, net_commission_amount,
-    // and customer_premium_amount stale. A coverage change that increased the
-    // premium would leave the customer billed the wrong amount. Now recompute
-    // the full breakdown from the freshly-updated premium_amount.
-    $ok2 = mysqli_query($conn,
-        "UPDATE " . APP_SCHEMA . ".policies p
-         SET
-           p.commission_tax_amount = ROUND(p.commission_amount * p.commission_tax_rate),
-           p.net_commission_amount = p.commission_amount - ROUND(p.commission_amount * p.commission_tax_rate),
-           p.customer_premium_amount = p.premium_amount + p.materai_amount + p.biaya_polis - p.commission_amount - p.diskon
-         WHERE p.policy_id = '$policy_id'"
-    );
-
-    // Keep the commissions record in sync with the updated policy totals
-    $ok3 = mysqli_query($conn,
-        "UPDATE " . APP_SCHEMA . ".commissions cm
-         JOIN  " . APP_SCHEMA . ".policies p ON p.policy_id = cm.policy_id
-         SET cm.premium_amount  = p.premium_amount,
-             cm.expected_amount = p.commission_amount,
-             cm.updated_at      = NOW()
-         WHERE cm.policy_id = '$policy_id' AND cm.status = 'pending'"
-    );
-
-    if ($ok1 && $ok2 && $ok3) {
-        mysqli_commit($conn);
-    } else {
-        mysqli_rollback($conn);
-        error_log("syncPolicyTotals failed for policy $policy_id: " . mysqli_error($conn));
-    }
-}
+// syncPolicyTotals() lives in helpers/coverage.php; endorsements bill through helpers/endorsements.php.
 
 // --- GET ALL coverages for a policy ---
 function getCoverages($conn, $policy_id, $company_id) {
@@ -73,10 +22,10 @@ function getCoverages($conn, $policy_id, $company_id) {
     }
 
     $result = mysqli_query($conn,
-        "SELECT coverage_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, created_at, updated_at
+        "SELECT coverage_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, location_id, created_at, updated_at
          FROM " . APP_SCHEMA . ".policy_coverages
          WHERE policy_id = '$policy_id'
-         ORDER BY FIELD(coverage_type, 'bangunan','stok','invenisi','mesin','dll'), coverage_label ASC"
+         ORDER BY location_id IS NULL, location_id, FIELD(coverage_type, 'bangunan','stok','invenisi','mesin','kendaraan','berharga','dll'), coverage_label ASC"
     );
 
     $rows = $result ? mysqli_fetch_all($result, MYSQLI_ASSOC) : [];
@@ -122,11 +71,18 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
 
     $change = policyChangeParse($input);
     policyChangeGuard($conn, $policy_id, $company_id, $change);
+    endAssertNotCancelled($conn, $company_id, $policy_id);
+    coverageAssertLocation($conn, $policy_id, $row['location_id']);
+    $billing = endBillingParse($input);
+    $before  = policyContractTotals($conn, $policy_id);
 
     $coverage_id = insertCoverageRow($conn, $policy_id, $row, $username, date('Y-m-d H:i:s'));
 
     if ($coverage_id !== null) {
-        syncPolicyTotals($conn, $policy_id);
+        syncPolicyTotals($conn, $policy_id, $change['kind']);
+        $label_text0 = $row['coverage_label'] !== null ? " ({$row['coverage_label']})" : '';
+        $ledger = endFromContractChange($conn, $company_id, $policy_id, $change, $billing, $before, policyContractTotals($conn, $policy_id),
+            'add_item', "Tambah item {$row['coverage_type']}{$label_text0}", 'coverage', $username, 'policy_coverages', $coverage_id);
         $label_text = $row['coverage_label'] !== null ? " ({$row['coverage_label']})" : '';
         // The policy already exists here, so this is a change after issuance → endorsement.
         // Coverages supplied in POST /policies are inserted there and never reach this log.
@@ -136,7 +92,7 @@ function addCoverage($conn, $policy_id, $input, $username, $company_id) {
             ['coverage_type' => $row['coverage_type'], 'sum_insured' => $row['sum_insured'],
              'rate_permille' => (float)$row['rate_permille'], 'premium_amount' => $row['premium_amount'],
              'count_in_tsi' => (bool)$row['count_in_tsi']]);
-        jsonResponse(201, 'Coverage item added', ['coverage_id' => $coverage_id, 'premium_amount' => $row['premium_amount']]);
+        jsonResponse(201, 'Coverage item added', ['coverage_id' => $coverage_id, 'premium_amount' => $row['premium_amount'], 'endorsement' => $ledger]);
     } else {
         error_log('addCoverage DB error: ' . mysqli_error($conn));
         jsonResponse(500, 'Failed to add coverage');
@@ -164,8 +120,23 @@ function updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $com
     $current = mysqli_fetch_assoc($check);
     $updates = [];
 
-    $change = policyChangeParse($input);
-    policyChangeGuard($conn, $policy_id, $company_id, $change);
+    // Moving an item to another risk location changes no money: data maintenance, not a correction or endorsement.
+    $contract_keys = array_diff(array_keys($input), ['location_id', 'change_kind', 'reason', 'endorsement_number', 'effective_date',
+        'calc_method', 'premium_delta', 'endorsement_materai', 'endorsement_biaya_polis', 'due_date', 'skip_billing']);
+    $location_only = array_key_exists('location_id', $input) && !$contract_keys;
+    $change = $location_only
+        ? ['kind' => 'correction', 'reason' => 'Pindah lokasi risiko', 'endorsement_number' => null, 'effective_date' => null]
+        : policyChangeParse($input);
+    if (!$location_only) policyChangeGuard($conn, $policy_id, $company_id, $change);
+    endAssertNotCancelled($conn, $company_id, $policy_id);
+    $billing = endBillingParse($input);
+    $before  = policyContractTotals($conn, $policy_id);
+
+    if (array_key_exists('location_id', $input)) {
+        $loc = is_string($input['location_id']) && trim($input['location_id']) !== '' ? trim($input['location_id']) : null;
+        coverageAssertLocation($conn, $policy_id, $loc);
+        $updates[] = "location_id = " . ($loc !== null ? "'" . mysqli_real_escape_string($conn, $loc) . "'" : 'NULL');
+    }
 
     if (isset($input['count_in_tsi'])) {
         // Use filter_var so string "false" is treated as false. PHP's truthiness
@@ -217,14 +188,22 @@ function updateCoverage($conn, $policy_id, $coverage_id, $input, $username, $com
     // so a future refactor that removes the ownership SELECT can't turn this
     // into a cross-policy write. Same applies to DELETE below.
     if (mysqli_query($conn, "UPDATE " . APP_SCHEMA . ".policy_coverages SET " . implode(', ', $updates) . " WHERE coverage_id = '$coverage_id' AND policy_id = '$policy_id'")) {
-        syncPolicyTotals($conn, $policy_id);
+        if ($location_only) {
+            // No figures moved: leave the totals, the commission and the original debit note alone.
+            insertPolicyLog($conn, $policy_id, $company_id, 'policy_updated', 'Item pertanggungan dipindah ke lokasi lain', $username,
+                null, null, 'policy_coverages', $coverage_id);
+            jsonResponse(200, 'Coverage item updated', ['premium_amount' => $premium, 'endorsement' => null]);
+        }
+        syncPolicyTotals($conn, $policy_id, $change['kind']);
+        $ledger = endFromContractChange($conn, $company_id, $policy_id, $change, $billing, $before, policyContractTotals($conn, $policy_id),
+            'sum_insured_change', 'Perubahan item pertanggungan', 'coverage', $username, 'policy_coverages', $coverage_id);
         $before = ['sum_insured' => (int)$current['sum_insured'], 'rate_permille' => (float)$current['rate_permille']];
         $after  = ['sum_insured' => $final_sum, 'rate_permille' => (float)$final_rate, 'premium_amount' => $premium];
         policyChangeLog($conn, $policy_id, $company_id, $change,
             'item pertanggungan diperbarui', $username,
             'policy_coverages', $coverage_id,
             ['before' => $before, 'after' => $after]);
-        jsonResponse(200, 'Coverage item updated', ['premium_amount' => $premium]);
+        jsonResponse(200, 'Coverage item updated', ['premium_amount' => $premium, 'endorsement' => $ledger]);
     } else {
         error_log('updateCoverage DB error: ' . mysqli_error($conn));
         jsonResponse(500, 'Failed to update coverage');
@@ -252,17 +231,23 @@ function deleteCoverage($conn, $policy_id, $coverage_id, $company_id, $username,
 
     $change = policyChangeParse($input);
     policyChangeGuard($conn, $policy_id, $company_id, $change);
+    endAssertNotCancelled($conn, $company_id, $policy_id);
+    $billing = endBillingParse($input);
+    $before  = policyContractTotals($conn, $policy_id);
 
     // Defense in depth: scope the DELETE by policy_id as well as coverage_id.
     if (mysqli_query($conn, "DELETE FROM " . APP_SCHEMA . ".policy_coverages WHERE coverage_id = '$coverage_id' AND policy_id = '$policy_id'")) {
-        syncPolicyTotals($conn, $policy_id);
+        syncPolicyTotals($conn, $policy_id, $change['kind']);
+        $label_text0 = $cov['coverage_label'] ? ' (' . $cov['coverage_label'] . ')' : '';
+        $ledger = endFromContractChange($conn, $company_id, $policy_id, $change, $billing, $before, policyContractTotals($conn, $policy_id),
+            'remove_item', "Hapus item {$cov['coverage_type']}{$label_text0}", 'coverage', $username, 'policy_coverages', $coverage_id);
         $label_text = $cov['coverage_label'] ? ' (' . $cov['coverage_label'] . ')' : '';
         policyChangeLog($conn, $policy_id, $company_id, $change,
             "item pertanggungan dihapus — {$cov['coverage_type']}{$label_text}", $username,
             'policy_coverages', $coverage_id,
             ['coverage_type' => $cov['coverage_type'], 'coverage_label' => $cov['coverage_label'],
              'sum_insured' => (int)$cov['sum_insured'], 'premium_amount' => (int)$cov['premium_amount']]);
-        jsonResponse(200, 'Coverage item deleted');
+        jsonResponse(200, 'Coverage item deleted', ['endorsement' => $ledger]);
     } else {
         error_log('deleteCoverage DB error: ' . mysqli_error($conn));
         jsonResponse(500, 'Failed to delete coverage');

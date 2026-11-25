@@ -169,6 +169,9 @@ function insertImportedPolicy($conn, string $company_id, string $username, array
     if (!$ok) { error_log('importPolicies insert failed: ' . mysqli_error($conn)); return false; }
 
     if (!insertCommission($conn, $policy_id, $company_id, $r['insurer_id'], $r['premium_amount'], $r['commission_rate'], $commission_amount, null, $r['commission_tax_rate'])) return false;
+    require_once __DIR__ . '/../helpers/endorsements.php';
+    snapshotIssuedPremium($conn, $policy_id);
+    ensurePolicyDebitNote($conn, $company_id, $policy_id);
     insertPolicyLog($conn, $policy_id, $company_id, 'policy_created', 'Polis dibuat (import)', $username);
     return true;
 }

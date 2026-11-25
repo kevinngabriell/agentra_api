@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/../helpers/endorsements.php';
+
 // Premium payment tracking (migration_payments.sql). Functions only; routing is in policies/index.php.
 //
 //   GET    /policies/{id}/payments                              due date, payment record, instalment schedule
@@ -45,14 +47,20 @@ function payReference($conn, mixed $value): string {
 function payFindPolicy($conn, string $policy_id, string $company_id): array {
     $pid = mysqli_real_escape_string($conn, $policy_id);
     $res = mysqli_query($conn, "SELECT policy_id, policy_number, coverage_start, payment_status, payment_due_date, payment_date,
-            payment_reference, premium_amount, customer_premium_amount, renewal_status
+            payment_reference, premium_amount, customer_premium_amount, issued_customer_premium, debit_note_number, renewal_status
         FROM " . APP_SCHEMA . ".policies WHERE policy_id = '$pid' AND company_id = '$company_id' LIMIT 1");
     if (!$res || mysqli_num_rows($res) === 0) throw ApiException::from('ERR_PAY_001');
     return mysqli_fetch_assoc($res);
 }
 
-/** What the customer is billed: customer_premium_amount when computed, else the gross premium. */
+/**
+ * What the customer is billed on the original debit note: the issued customer premium (frozen at issuance,
+ * v2.1.0), else customer_premium_amount when computed, else the gross premium. Endorsements are billed on
+ * their own notes (policy_endorsements).
+ */
 function payExpectedAmount(array $policy): int {
+    $issued = isset($policy['issued_customer_premium']) ? (int)$policy['issued_customer_premium'] : 0;
+    if ($issued > 0) return $issued;
     $billed = (int)$policy['customer_premium_amount'];
     return $billed > 0 ? $billed : (int)$policy['premium_amount'];
 }
@@ -107,6 +115,8 @@ function getPolicyPayments($conn, string $policy_id, string $company_id): void {
         'days_until_due'    => $unpaid ? $days : null,
         'urgency'           => $unpaid ? paymentUrgency($days) : null,
         'installments'      => $installments,
+        // [v2.1.0] Number of the original debit note, assigned the first time the policy's billing is read.
+        'debit_note_number' => $policy['debit_note_number'] ?: ensurePolicyDebitNote($conn, $company_id, $policy_id),
     ]);
 }
 
@@ -229,7 +239,7 @@ function payInstallment($conn, string $policy_id, string $company_id, string $in
 // GET /policies/overdue-premiums
 function listOverduePremiums($conn, string $company_id, array $q): void {
     $res = mysqli_query($conn, "SELECT p.policy_id, p.policy_number, p.product_type, p.coverage_start, p.coverage_end,
-            p.premium_amount, p.customer_premium_amount, p.payment_due_date,
+            p.premium_amount, p.customer_premium_amount, p.issued_customer_premium, p.payment_due_date,
             c.customer_id, c.display_name AS customer_name, c.customer_type,
             c.personal_whatsapp, c.pic_whatsapp,
             i.short_name AS insurer_short_name,
@@ -253,7 +263,7 @@ function listOverduePremiums($conn, string $company_id, array $q): void {
         $due = $r['next_installment_due'] ?: ($r['payment_due_date'] ?: payEffectiveDueDate($r));
         $days = payDaysUntil($due);
         $urgency = paymentUrgency($days);
-        $billed = (int)$r['customer_premium_amount'] > 0 ? (int)$r['customer_premium_amount'] : (int)$r['premium_amount'];
+        $billed = payExpectedAmount($r);
         $amount = $r['next_installment_due'] ? ($inst_amount[$r['policy_id']] ?? $billed) : $billed;
 
         if ($urgency === 'overdue' || $urgency === 'cancellation_risk') {
@@ -275,6 +285,47 @@ function listOverduePremiums($conn, string $company_id, array $q): void {
             'due_date' => $due, 'amount_due' => $amount, 'billed_amount' => $billed,
             'is_installment' => $r['next_installment_due'] !== null,
             'days_until_due' => $days, 'urgency' => $urgency,
+            'kind' => 'policy', 'note_number' => null, 'reference_id' => null,
+        ];
+    }
+
+    // [v2.1.0] Unpaid endorsement debit notes and multi-year premiums are owed too.
+    require_once __DIR__ . '/../helpers/db.php';
+    $extra = dbAll($conn, "SELECT 'endorsement' AS kind, e.endorsement_id AS reference_id, e.note_number, e.due_date,
+            (e.premium_delta + e.materai_amount + e.biaya_polis) AS amount, p.policy_id, p.policy_number, p.product_type,
+            p.coverage_start, p.coverage_end, c.customer_id, c.display_name AS customer_name, c.customer_type,
+            c.personal_whatsapp, c.pic_whatsapp, i.short_name AS insurer_short_name
+        FROM {app}.policy_endorsements e
+        JOIN {app}.policies p ON p.policy_id = e.policy_id
+        JOIN {app}.customers c ON c.customer_id = p.customer_id
+        LEFT JOIN {app}.insurers i ON i.insurer_id = p.insurer_id
+        WHERE e.company_id = ? AND e.is_void = 0 AND e.note_type = 'debit' AND e.settled_date IS NULL AND e.due_date IS NOT NULL
+        UNION ALL
+        SELECT 'year', y.year_id, CONCAT('Tahun ke-', y.year_no), COALESCE(y.due_date, y.period_start), y.premium_amount,
+            p.policy_id, p.policy_number, p.product_type, y.period_start, y.period_end, c.customer_id, c.display_name, c.customer_type,
+            c.personal_whatsapp, c.pic_whatsapp, i.short_name
+        FROM {app}.policy_year_schedule y
+        JOIN {app}.policies p ON p.policy_id = y.policy_id
+        JOIN {app}.customers c ON c.customer_id = p.customer_id
+        LEFT JOIN {app}.insurers i ON i.insurer_id = p.insurer_id
+        WHERE y.company_id = ? AND y.paid_date IS NULL AND y.year_no > 1 AND p.renewal_status <> 'cancelled'",
+        [$company_id, $company_id]);
+    foreach ($extra as $r) {
+        $days = payDaysUntil($r['due_date']);
+        $urgency = paymentUrgency($days);
+        $amount = (int)$r['amount'];
+        if ($urgency === 'overdue' || $urgency === 'cancellation_risk') { $summary['overdue_count']++; $summary['overdue_amount'] += $amount; }
+        if ($urgency === 'cancellation_risk') $summary['cancellation_risk_count']++;
+        if ($urgency === 'due_soon') { $summary['due_soon_count']++; $summary['due_soon_amount'] += $amount; }
+        $rows[] = [
+            'policy_id' => $r['policy_id'], 'policy_number' => $r['policy_number'], 'product_type' => $r['product_type'],
+            'customer_id' => $r['customer_id'], 'customer_name' => $r['customer_name'], 'customer_type' => $r['customer_type'],
+            'whatsapp' => $r['customer_type'] === 'company' ? $r['pic_whatsapp'] : $r['personal_whatsapp'],
+            'insurer_short_name' => $r['insurer_short_name'],
+            'coverage_start' => $r['coverage_start'], 'coverage_end' => $r['coverage_end'],
+            'due_date' => $r['due_date'], 'amount_due' => $amount, 'billed_amount' => $amount,
+            'is_installment' => false, 'days_until_due' => $days, 'urgency' => $urgency,
+            'kind' => $r['kind'], 'note_number' => $r['note_number'], 'reference_id' => $r['reference_id'],
         ];
     }
 

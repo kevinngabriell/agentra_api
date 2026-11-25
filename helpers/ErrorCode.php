@@ -348,6 +348,28 @@ final class ErrorCode
         'ERR_MSG_009' => [422, 'Segmen terlalu besar ({count} penerima). Maksimal {max} per broadcast, persempit segmen.'],
         'ERR_MSG_010' => [500, 'Gagal menyimpan data pesan'],
         'ERR_MSG_011' => [403, 'Tidak memiliki izin untuk menjalankan pesan otomatis'],
+
+        // v2.1.0 large-account modules (endorsement ledger, schedules, parties, claims depth, compliance)
+        'ERR_V21_001' => [400, 'Nilai tidak valid untuk {field}'],
+        'ERR_V21_002' => [400, '{field} wajib diisi'],
+        'ERR_V21_003' => [400, '{field} terlalu panjang (maksimal {max} karakter)'],
+        'ERR_V21_004' => [404, 'Data tidak ditemukan'],
+        'ERR_V21_005' => [409, 'Polis sudah dibatalkan'],
+        'ERR_V21_006' => [409, 'Nota ini sudah dilunasi'],
+        'ERR_V21_007' => [422, 'Total share koasuransi harus 100% sebelum polis diperpanjang (saat ini {total}%)'],
+        'ERR_V21_008' => [409, 'Lokasi masih dipakai oleh {count} item pertanggungan. Pindahkan atau hapus item tersebut dahulu.'],
+        'ERR_V21_009' => [422, 'Polis ini bukan polis stok deklarasi. Aktifkan stok deklarasi di Detail Risiko.'],
+        'ERR_V21_010' => [422, 'Belum ada deklarasi stok untuk dihitung'],
+        'ERR_V21_011' => [409, 'Kendaraan dengan nomor polisi {plate} sudah ada di polis ini'],
+        'ERR_V21_012' => [422, 'Maksimal {max} baris per impor'],
+        'ERR_V21_013' => [422, 'Tanggal pembatalan harus dalam masa pertanggungan ({start} s/d {end})'],
+        'ERR_V21_014' => [422, 'Polis yang sudah dibatalkan tidak dapat diubah'],
+        'ERR_V21_015' => [422, 'Status klaim tidak mengizinkan pembayaran: {why}'],
+        'ERR_V21_016' => [422, 'Total pembayaran klaim melebihi jumlah yang disetujui'],
+        'ERR_V21_017' => [409, 'Kode {code} sudah ada'],
+        'ERR_V21_018' => [422, 'Item pertanggungan bukan milik polis ini'],
+        'ERR_V21_019' => [422, 'Tidak ada penawaran yang dipilih untuk panel koasuransi'],
+        'ERR_V21_020' => [422, 'Total share panel koasuransi harus 100% (saat ini {total}%)'],
     ];
 
     public static function httpStatus(string $code): int

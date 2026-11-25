@@ -25,6 +25,14 @@ $src = mysqli_fetch_assoc($srcRes);
 if (in_array($src['renewal_status'], ['renewed', 'cancelled'], true)) {
     jsonResponse(409, "Policy is already {$src['renewal_status']} and cannot be renewed again");
 }
+
+// [v2.1.0] A co-insured policy only renews with a complete panel (shares totalling 100%).
+require_once __DIR__ . '/../helpers/schedules.php';
+require_once __DIR__ . '/../helpers/endorsements.php';
+$coassTotal = coassuranceTotal($conn, $policy_id);
+if ($coassTotal !== null && abs($coassTotal - 100) > 0.01) {
+    throw ApiException::from('ERR_V21_007', ['total' => rtrim(rtrim(number_format($coassTotal, 2, '.', ''), '0'), '.')]);
+}
 $new_policy_number = trim(mysqli_real_escape_string($conn, $input['policy_number']));
 $dup = mysqli_query($conn, "SELECT 1 FROM " . APP_SCHEMA . ".policies WHERE company_id = '$company_id' AND policy_number = '$new_policy_number' LIMIT 1");
 if (!$dup) {
@@ -125,7 +133,7 @@ $biaya_polis    = isset($input['biaya_polis'])    ? max(0, (int)$input['biaya_po
 $diskon         = isset($input['diskon'])         ? max(0, (int)$input['diskon'])         : (int)$src['diskon'];
 
 // ── Item pertanggungan (policy_coverages): copy from source, recompute totals from the copy ──
-$covRes = mysqli_query($conn, "SELECT coverage_id AS source_coverage_id, coverage_type, coverage_label, sum_insured, rate_permille, count_in_tsi
+$covRes = mysqli_query($conn, "SELECT coverage_id AS source_coverage_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, location_id
     FROM " . APP_SCHEMA . ".policy_coverages WHERE policy_id = '$policy_id'");
 $sourceCoverages = $covRes ? mysqli_fetch_all($covRes, MYSQLI_ASSOC) : [];
 
@@ -199,6 +207,11 @@ try {
          0, $nt, '$username', '$now')");
     if (!$ok) throw new Exception('renewed policy insert failed: ' . mysqli_error($conn));
 
+    // [v2.1.0] Currency, renewal lead time and risk locations carry over (coverage items are re-linked below).
+    dbExec($conn, "UPDATE {app}.policies SET currency = ?, exchange_rate = ?, renewal_lead_days = ? WHERE policy_id = ?",
+        [$src['currency'] ?? 'IDR', (float)($src['exchange_rate'] ?? 1), $src['renewal_lead_days'] !== null ? (int)$src['renewal_lead_days'] : null, $new_policy_id]);
+    $locationMap = scheduleCopyLocations($conn, $policy_id, $new_policy_id, $company_id, $username);
+
     // Copy coverage line items onto the new policy, then derive sum_insured/premium_amount from them.
     $coverageMap = [];
     foreach ($sourceCoverages as $cov) {
@@ -206,9 +219,10 @@ try {
         $coverageMap[$cov['source_coverage_id']] = $coverage_id;
         $label = $cov['coverage_label'] !== null ? "'" . mysqli_real_escape_string($conn, $cov['coverage_label']) . "'" : 'NULL';
         $covType = mysqli_real_escape_string($conn, $cov['coverage_type']);
+        $locSql = $cov['location_id'] !== null && isset($locationMap[$cov['location_id']]) ? "'" . $locationMap[$cov['location_id']] . "'" : 'NULL';
         if (!mysqli_query($conn, "INSERT INTO " . APP_SCHEMA . ".policy_coverages
-            (coverage_id, policy_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, created_by, created_at)
-            VALUES ('$coverage_id', '$new_policy_id', '$covType', $label, {$cov['sum_insured']}, {$cov['rate_permille']}, {$cov['premium_amount']}, {$cov['count_in_tsi']}, '$username', '$now')")) {
+            (coverage_id, policy_id, coverage_type, coverage_label, sum_insured, rate_permille, premium_amount, count_in_tsi, location_id, created_by, created_at)
+            VALUES ('$coverage_id', '$new_policy_id', '$covType', $label, {$cov['sum_insured']}, {$cov['rate_permille']}, {$cov['premium_amount']}, {$cov['count_in_tsi']}, $locSql, '$username', '$now')")) {
             throw new Exception('coverage copy insert failed: ' . mysqli_error($conn));
         }
     }
@@ -256,6 +270,14 @@ try {
     $okCommission = insertCommission($conn, $new_policy_id, $company_id, $src['insurer_id'], $premium_amount, $commission_rate, $commission_amount,
         $src['issuing_agent_id'] ?: null, $commission_tax_rate);
     if (!$okCommission) throw new Exception('commission insert failed');
+
+    // [v2.1.0] Fleet vehicles, banks / leasing and the co-insurance panel carry over; the new policy's
+    // original debit note is frozen at its figures.
+    scheduleCopyVehicles($conn, $policy_id, $new_policy_id, $company_id, $username, $coverageMap);
+    scheduleCopyParties($conn, $policy_id, $new_policy_id, $company_id, $username);
+    scheduleCopyCoassurance($conn, $policy_id, $new_policy_id, $username);
+    snapshotIssuedPremium($conn, $new_policy_id);
+    ensurePolicyDebitNote($conn, $company_id, $new_policy_id);
 
     insertPolicyLog($conn, $new_policy_id, $company_id, 'policy_created',
         "Polis diperpanjang dari {$src['policy_number']}", $username,
